@@ -34,6 +34,14 @@ export type { HarnessAttachment, HarnessTurnOptions } from './harness/contracts'
 
 export type { HarnessUsage, HarnessUsageEntry, HarnessTokens } from './harness/usage';
 
-export type { HarnessSlashCommand, HarnessCommandResult } from './harness/contracts';
+export type { HarnessSlashCommand, HarnessCommandResult, HarnessCommandRecord, HarnessCommandQuery, HarnessQueryOptions } from './harness/contracts';
 
 export type {HarnessModel, HarnessModelCatalog, HarnessModelSelection, HarnessCommandOptions} from './harness/contracts';
+
+export type {HarnessInstruction, HarnessInstructionQueue, HarnessQueueEdit, HarnessQueueProjection} from './harness/instruction-queue';
+
+export type {HarnessInterruptRequest, HarnessControlRecord, HarnessControlProjection} from './harness/control-ledger';
+
+export type {HarnessCommandCatalog, HarnessCommandObservation} from './harness/contracts';
+export type {HarnessCommandOutputRef, HarnessCommandOutputPage, HarnessCommandOutputOptions, HarnessCommandOutputLoadOptions,
+    HarnessCommandOutputIssue, HarnessCommandOutput} from './harness/contracts';

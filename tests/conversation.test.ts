@@ -1,11 +1,96 @@
 import { expect, it, vi } from 'vitest';
 import { HarnessConversation } from '../src/harness/conversation';
+import { MCPHarnessClient } from '../src/harness/client';
 import type { HarnessClient, HarnessProfile } from '../src/harness/contracts';
 import type { HarnessRecovery } from '../src/harness/conversation-journal';
 import { historyMessages, mergeMessages } from '../src/harness/conversation-model';
 import { toolSummary } from '../src/harness/tool-summary';
 const profile: HarnessProfile = {id:'codex', kind:'codex', projectRuntime:true, workspaces:[{id:'p'}], capabilities:{history:true,create:true,resume:true,interrupt:true,interactions:true}};
 const session = {id:'s', title:'Title', cwd:'/projects/p', status:'idle', updatedAt:1, resumable:true, owned:true};
+const queryCommand = {name: 'session:status', description: 'State', kind: 'action' as const, execution: 'query' as const, revision: 'state-v1'};
+const queryProfile = {...profile, capabilities: {...profile.capabilities, slashCommands: true, commandQueries: true}};
+
+it('reads an explicitly requested query without loading history, refreshing the catalog or trusting stale execution state', async () => {
+    const client = peer(); client.commands = vi.fn(async () => {throw new Error('Directory unavailable');});
+    vi.mocked(client.read).mockRejectedValue(new Error('History unavailable'));
+    client.queryCommand = vi.fn(async (_p, _s, _n, _a, options) => ({commandId: options!.requestId, status: 'completed', output: 'Observed state'}));
+    const view = new HarnessConversation(client, queryProfile, 'p', 's');
+    expect(await view.queryCommand('session:status', '', 'query')).toMatchObject({queryReceipts: [{id: 'query', status: 'accepted'}], canSend: false});
+    expect(client.read).not.toHaveBeenCalled(); expect(client.commands).not.toHaveBeenCalled(); expect(client.resume).not.toHaveBeenCalled();
+    await view.close();
+});
+
+it('persists a query during a suspended send without replacing its receipt, queued work or newer draft', async () => {
+    const client = peer(); let record: HarnessRecovery | undefined, finish!: (value: {turnId: string}) => void;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    client.commands = vi.fn(async () => [queryCommand]);
+    client.queryCommand = vi.fn(async (_profile, _session, _name, _args, options) => ({commandId: options!.requestId, output: 'Observed state', status: 'completed'}));
+    client.command = vi.fn(); client.turn = vi.fn(() => new Promise(resolve => {finish = resolve;}));
+    const view = new HarnessConversation(client, queryProfile, 'p', 's', true, journal); await view.read(); await view.commands();
+    const sending = view.send('Original', [], undefined, 'original-send');
+    await vi.waitFor(() => expect(client.turn).toHaveBeenCalledOnce());
+    await view.saveDraft('Newer input'); await view.enqueue('Queued next', [], undefined, 'next');
+    expect(view.snapshot()).toMatchObject({pending: true, canQueryCommand: true, canCommand: false});
+    const pending = structuredClone(record!.pending), submission = structuredClone(record!.submission);
+    const result = await view.command(queryCommand.name, '', undefined, '/session:status', 'read-state', queryCommand);
+    expect(result).toMatchObject({pending: true, draft: 'Newer input', submission, queryReceipts: [{id: 'read-state', status: 'accepted'}]});
+    expect(record!.pending).toEqual(pending); expect(record!.instructionQueue!.items[0].id).toBe('next');
+    expect(result.messages).toContainEqual(expect.objectContaining({id: 'command:read-state', role: 'system', text: 'Observed state'}));
+    await view.queryCommand(queryCommand.name, '', 'read-state', queryCommand);
+    expect(client.queryCommand).toHaveBeenCalledOnce(); expect(client.command).not.toHaveBeenCalled(); expect(client.resume).not.toHaveBeenCalled();
+    await view.reconcile('read-state'); expect(client.operation).not.toHaveBeenCalled();
+    finish({turnId: 'original-turn'}); await sending; await view.close();
+    const reopened = new HarnessConversation(client, queryProfile, 'p', 's', true, journal); await reopened.read();
+    expect((await reopened.reconcile('read-state')).queryReceipts).toEqual([{id: 'read-state', status: 'accepted'}]);
+    expect(client.operation).not.toHaveBeenCalled(); await reopened.close();
+});
+
+it('recovers an uncertain query report write without re-reading native state or settling the input operation', async () => {
+    const client = peer(); let record: HarnessRecovery | undefined, fail = true;
+    const pending = {requestId: 'original', epoch: 'e', operation: 'turn', inputText: 'Original'};
+    record = {sessionId: 's', pending, submission: {id: 'original', status: 'pending'}, draft: 'Keep'};
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {
+        record = structuredClone(value); if (fail && value.commandResults?.length) {fail = false; throw new Error('Lost storage response');}
+    }};
+    client.commands = vi.fn(async () => [queryCommand]);
+    client.queryCommand = vi.fn(async (_p, _s, _c, _a, options) => ({commandId: options!.requestId, output: 'Observed', status: 'completed'}));
+    const view = new HarnessConversation(client, queryProfile, 'p', 's', true, journal); await view.read(); await view.commands();
+    await expect(view.queryCommand(queryCommand.name, '', 'query')).rejects.toThrow('Lost storage response');
+    expect(view.snapshot()).toMatchObject({pending: true, draft: 'Keep', queryReceipts: [], pendingQueryReports: ['query'], submission: {id: 'original', status: 'pending'}});
+    expect(await view.reconcileQuery('query')).toMatchObject({queryReceipts: [{id: 'query', status: 'accepted'}], pendingQueryReports: []});
+    expect(record!.pending).toEqual(pending); expect(client.queryCommand).toHaveBeenCalledOnce(); expect(client.operation).not.toHaveBeenCalled();
+    await view.close();
+});
+
+it('keeps read failures outside execution uncertainty and requires positively negotiated query support', async () => {
+    const client = peer(); client.commands = vi.fn(async () => [queryCommand]);
+    client.queryCommand = vi.fn(async () => {throw new Error('Read unavailable');});
+    const view = new HarnessConversation(client, queryProfile, 'p', 's'); await view.read(); await view.commands(); await view.saveDraft('Keep');
+    await expect(view.queryCommand(queryCommand.name, '', 'query')).rejects.toMatchObject({outcome: 'not-committed'});
+    expect(view.snapshot()).toMatchObject({pending: false, canSend: true, draft: 'Keep', queryReceipts: []});
+    await expect(view.queryCommand(queryCommand.name, 'side effect', 'bad')).rejects.toMatchObject({outcome: 'not-committed'});
+    const legacy = new HarnessConversation(client, {...queryProfile, capabilities: {...queryProfile.capabilities, commandQueries: false}}, 'p', 's');
+    await legacy.read(); await expect(legacy.queryCommand(queryCommand.name)).rejects.toMatchObject({code: 'ECAPABILITY'});
+    expect(client.queryCommand).toHaveBeenCalledOnce(); await legacy.close(); await view.close();
+});
+
+it('does not turn an absent durable query report into a native mutation receipt lookup', async () => {
+    const client = peer(), view = new HarnessConversation(client, queryProfile, 'p', 's'); await view.read();
+    expect((await view.reconcileQuery('missing-query')).queryReceipts).toEqual([]);
+    expect(client.operation).not.toHaveBeenCalled(); expect(view.snapshot().pending).toBe(false); await view.close();
+});
+it('projects partial command discovery independently of conversation connectivity and input readiness', async () => {
+    const client = peer(); client.commands = vi.fn();
+    let catalog = {commands: [{name: 'session:status', description: 'State', kind: 'action' as const, execution: 'query' as const}],
+        observation: {complete: false, code: 'DSH_SESSION_NOT_ATTACHED'}};
+    client.commandCatalog = vi.fn(async () => catalog);
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, slashCommands: true}}, 'p', 's');
+    await view.read(); await view.commands();
+    expect(view.snapshot()).toMatchObject({disconnected: false, canSend: true, commandCatalogObservation: catalog.observation});
+    expect(client.commands).not.toHaveBeenCalled();
+    catalog = {...catalog, observation: {complete: true, code: ''}}; await view.commands();
+    expect(view.snapshot().commandCatalogObservation?.complete).toBe(true); await view.close();
+});
 
 it('disables mutation controls on an expired observation and restores them after refresh', async () => {
     vi.useFakeTimers();
@@ -89,6 +174,271 @@ function peer(): HarnessClient {
         interrupt:vi.fn(async () => {}), respond:vi.fn(async () => {}), operation:vi.fn(), close:vi.fn(async () => {}),
         eventSnapshot:vi.fn(async () => ({epoch:'events',cursor:1,gap:false,events:[],requests:[]}))};
 }
+it('restores legacy attachments for queries and repair while rejecting native dispatch before session preparation', async () => {
+    const client = peer(), capable = {...queryProfile, capabilities: {...queryProfile.capabilities, attachments: ['image' as const]}};
+    const files = [{kind: 'image' as const, name: 'legacy.png', content: 'data:image/png;base64,AQID', mimeType: 'image/png'}];
+    let record: HarnessRecovery = {sessionId: 's', draft: 'Keep original', draftRevision: 7, draftAttachments: files,
+        instructionQueue: {revision: 3, paused: true, items: [{id: 'legacy', text: 'Old queued input', attachments: files, createdAt: 1, state: 'pending'}], receipts: []}};
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    client.queryCommand = vi.fn(async () => ({commandId: 'query', status: 'completed', output: 'Observed'}));
+    const view = new HarnessConversation(client, capable, 'p', 's', true, journal);
+    expect(await view.read()).toMatchObject({draft: 'Keep original', draftAttachments: files, instructionQueue: {items: [{id: 'legacy'}]}});
+    expect(record.draftRevision).toBe(7);
+    expect(await view.queryCommand(queryCommand.name, '', 'query')).toMatchObject({queryReceipts: [{id: 'query', status: 'accepted'}]});
+    await expect(view.send('Keep original', files)).rejects.toMatchObject({attachmentCode: 'HARNESS_ATTACHMENT_MIME_MISMATCH'});
+    expect(record.draftAttachments).toEqual(files); expect(client.turn).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled(); expect(client.resume).not.toHaveBeenCalled();
+    await view.editInstructionQueue({action: 'resume', expectedRevision: 3}); await view.refresh();
+    expect(view.snapshot().instructionQueue).toMatchObject({paused: true, items: [{id: 'legacy', state: 'failed', error: 'HARNESS_ATTACHMENT_MIME_MISMATCH'}]});
+    await view.editInstructionQueue({action: 'remove', id: 'legacy', expectedRevision: view.snapshot().instructionQueue!.revision});
+    await view.saveDraft('Repaired'); expect(record.draftAttachments).toEqual([]);
+    expect(client.turn).not.toHaveBeenCalled(); await view.close();
+});
+
+it('reconciles an old uncertain turn without revalidating or replaying its stored attachments', async () => {
+    const client = peer(), files = [{kind: 'text' as const, name: 'legacy.txt', content: '\ud800'}];
+    let record: HarnessRecovery = {sessionId: 's', draft: 'Original', draftAttachments: files,
+        pending: {requestId: 'original', epoch: 'old-epoch', operation: 'turn', inputText: 'Original'}, submission: {id: 'original', status: 'pending'},
+        instructionQueue: {revision: 3, paused: true, items: [{id: 'original', text: 'Original', attachments: files, createdAt: 1, state: 'uncertain'}], receipts: []}};
+    const journal = {epoch: 'new-epoch', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    vi.mocked(client.operation).mockResolvedValue({requestId: 'original', outcome: 'unknown'});
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, attachments: ['text']}}, 'p', 's', true, journal);
+    await view.read(); await view.reconcile('original'); await view.refresh();
+    expect(client.operation).toHaveBeenCalledWith('codex', 'original', expect.objectContaining({epoch: 'old-epoch'}));
+    expect(record).toMatchObject({draftAttachments: files, pending: {requestId: 'original'}, instructionQueue: {items: [{id: 'original', state: 'uncertain'}]}});
+    expect(client.turn).not.toHaveBeenCalled(); expect(client.create).not.toHaveBeenCalled(); expect(client.resume).not.toHaveBeenCalled();
+    await view.close();
+});
+
+it('checks new and edited queue prompt bytes without changing prior accepted instructions', async () => {
+    const client = peer(); let record: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal); await view.read();
+    await view.enqueue('Original', [], undefined, 'first'); const before = structuredClone(record);
+    await expect(view.enqueue('中'.repeat(50000), [], undefined, 'oversize')).rejects.toMatchObject({attachmentCode: 'HARNESS_PROMPT_LIMIT'});
+    await expect(view.editInstructionQueue({action: 'update', id: 'first', text: '中'.repeat(50000), expectedRevision: before!.instructionQueue!.revision})).rejects.toMatchObject({attachmentCode: 'HARNESS_PROMPT_LIMIT'});
+    expect(record).toEqual(before); expect(client.turn).not.toHaveBeenCalled(); await view.close();
+});
+
+it('queues attachment-only input using its original identity and reconciles a lost acknowledgement without resending', async () => {
+    const client = peer(), files = [{kind: 'text' as const, name: 'notes.txt', content: 'Review these notes'}];
+    const capable = {...profile, capabilities: {...profile.capabilities, attachments: ['text' as const]}};
+    let record: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    client.turn = vi.fn(async () => {throw {outcome: 'unknown'};});
+    const first = new HarnessConversation(client, capable, 'p', 's', true, journal); await first.read();
+    await first.saveDraft('', files); await first.enqueue('', files, undefined, 'file-only');
+    expect(record!.instructionQueue!.items[0]).toMatchObject({id: 'file-only', text: '', attachments: files});
+    await first.refresh(); expect(client.turn).toHaveBeenCalledWith('codex', 's', 'Attachments: notes.txt', expect.objectContaining({requestId: 'file-only', attachments: files}));
+    expect(record!.pending).toMatchObject({requestId: 'file-only', inputText: '', operation: 'turn'}); await first.close();
+    vi.mocked(client.operation).mockResolvedValue({requestId: 'file-only', outcome: 'committed', result: {turnId: 'native-file-only'}});
+    const next = new HarnessConversation(client, capable, 'p', 's', true, journal); await next.read();
+    await next.reconcile('file-only'); await next.refresh();
+    expect(record).toMatchObject({draft: '', draftAttachments: [], submission: {id: 'file-only', status: 'accepted', turnId: 'native-file-only'}});
+    expect(client.turn).toHaveBeenCalledOnce(); await next.close();
+});
+
+it('retains newer file-only drafts after an earlier attachment-only turn is acknowledged', async () => {
+    const client = peer(), original = [{kind: 'text' as const, name: 'notes.txt', content: 'Original'}], newer = [{...original[0], content: 'Changed'}];
+    let record: HarnessRecovery | undefined, finish!: (value: {turnId: string}) => void;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    client.turn = vi.fn(() => new Promise(resolve => {finish = resolve;}));
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, attachments: ['text']}}, 'p', 's', true, journal); await view.read();
+    const sending = view.send('', original, undefined, 'first-file');
+    await vi.waitFor(() => expect(client.turn).toHaveBeenCalledOnce());
+    await view.saveDraft('', newer); finish({turnId: 'first-file-turn'}); await sending;
+    expect(record!.draftAttachments).toEqual(newer); expect(record!.pending).toBeUndefined();
+    await expect(view.send('')).rejects.toMatchObject({attachmentCode: 'HARNESS_PROMPT_INVALID'});
+    expect(client.turn).toHaveBeenCalledOnce(); await view.close();
+});
+
+it('persists queued native instructions, edits them and dispatches once in order', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    const turns: Array<{id: string; status: string; items: unknown[]}> = [];
+    vi.mocked(client.read).mockImplementation(async () => ({session: {...session}, turns: [...turns]}));
+    vi.mocked(client.turn).mockImplementation(async () => {
+        const turnId = `turn-${turns.length + 1}`; turns.push({id: turnId, status: 'completed', items: []}); return {turnId};
+    });
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal); await view.read();
+    await Promise.all([view.enqueue('First', [], undefined, 'queue-first'), view.enqueue('Second', [], undefined, 'queue-second')]);
+    expect(client.turn).not.toHaveBeenCalled(); expect(saved?.instructionQueue?.items).toHaveLength(2);
+    let queue = view.snapshot().instructionQueue!;
+    await view.editInstructionQueue({action: 'update', id: 'queue-second', text: 'Revised second', expectedRevision: queue.revision});
+    await expect(view.editInstructionQueue({action: 'remove', id: 'queue-first', expectedRevision: queue.revision})).rejects.toMatchObject({code: 'ECONFLICT'});
+    await view.enqueue('Second', [], undefined, 'queue-second');
+    expect(view.snapshot().instructionQueue?.items).toHaveLength(2);
+    await view.refresh(); expect(client.turn).toHaveBeenCalledOnce();
+    await view.refresh(); expect(client.turn).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(client.turn).mock.calls.map(args => args[2])).toEqual(['First', 'Revised second']);
+    expect(vi.mocked(client.turn).mock.calls.map(args => args[3]?.requestId)).toEqual(['queue-first', 'queue-second']);
+    await view.refresh(); expect(view.snapshot().instructionQueue?.items).toEqual([]);
+    expect(view.snapshot().instructionQueue?.submissions).toEqual([
+        {id: 'queue-first', turnId: 'turn-1', commandId: undefined},
+        {id: 'queue-second', turnId: 'turn-2', commandId: undefined},
+    ]);
+    await view.close();
+    const reopened = new HarnessConversation(client, profile, 'p', 's', true, journal);
+    await reopened.read(); expect(reopened.snapshot().instructionQueue?.submissions).toEqual(view.snapshot().instructionQueue?.submissions);
+    expect(client.turn).toHaveBeenCalledTimes(2); await reopened.close();
+});
+
+it('keeps an uncertain native queue claim on reopen and reconciles without replaying it', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    vi.mocked(client.read).mockResolvedValue({session: {...session}, turns: [{id: 't', status: 'completed', items: []}]});
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    vi.mocked(client.turn).mockRejectedValueOnce(new TypeError('Lost response'));
+    const first = new HarnessConversation(client, profile, 'p', 's', true, journal); await first.read();
+    await first.enqueue('Do once', [], undefined, 'uncertain-queue'); await first.refresh();
+    expect(first.snapshot().instructionQueue).toMatchObject({paused: true, items: [{id: 'uncertain-queue', state: 'uncertain'}]});
+    await first.close();
+    vi.mocked(client.operation).mockResolvedValue({requestId: 'uncertain-queue', outcome: 'unknown'});
+    const reopened = new HarnessConversation(client, profile, 'p', 's', true, journal); await reopened.read(); await reopened.refresh();
+    expect(client.turn).toHaveBeenCalledOnce(); expect(reopened.snapshot().instructionQueue?.items).toHaveLength(1);
+    vi.mocked(client.operation).mockResolvedValue({requestId: 'uncertain-queue', outcome: 'committed', result: {turnId: 't'}});
+    await reopened.refresh();
+    expect(client.turn).toHaveBeenCalledOnce(); expect(reopened.snapshot().instructionQueue).toMatchObject({paused: true, items: []});
+    await reopened.close();
+});
+
+it('does not dispatch queued instructions when durable acceptance fails or leak attachment bodies in projections', async () => {
+    const client = peer(); const journal = {epoch: 'e', load: async () => undefined, save: vi.fn(async () => {throw new Error('Storage unavailable');})};
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, attachments: ['text']}}, 'p', 's', true, journal);
+    await view.read();
+    await expect(view.enqueue('Retain me', [{kind: 'text', name: 'a.txt', content: 'private-body'}], undefined, 'not-accepted')).rejects.toThrow('Storage unavailable');
+    await view.refresh(); expect(client.turn).not.toHaveBeenCalled(); expect(view.snapshot().instructionQueue?.items).toEqual([]);
+    journal.save.mockResolvedValue(undefined as never);
+    await view.enqueue('Accepted', [{kind: 'text', name: 'a.txt', content: 'private-body'}], undefined, 'accepted');
+    expect(JSON.stringify(view.snapshot().instructionQueue)).not.toContain('private-body');
+    await view.close();
+});
+it('waits for the corresponding native turn completion instead of advancing on an idle history alone', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    const view = new HarnessConversation(client, profile, 'p', 's', true,
+        {epoch: 'e', load: async () => saved, save: async record => {saved = structuredClone(record);}});
+    await view.read(); await view.enqueue('First', [], undefined, 'first'); await view.enqueue('Second', [], undefined, 'second');
+    await view.refresh(); await view.refresh();
+    expect(client.turn).toHaveBeenCalledOnce(); expect(view.snapshot().instructionQueue?.items).toHaveLength(2);
+    vi.mocked(client.eventSnapshot).mockResolvedValue({epoch: 'events', cursor: 2, gap: false, requests: [],
+        events: [{seq: 2, message: {method: 'turn/completed', params: {threadId: 's', turn: {id: 't', status: 'completed'}}}}]});
+    await view.refresh(); expect(client.turn).toHaveBeenCalledTimes(2);
+    await view.close();
+});
+it('recovers a persisted queue acceptance whose storage acknowledgement was lost before any native call', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined, loseReply = true;
+    const view = new HarnessConversation(client, profile, 'p', 's', true, {epoch: 'e', load: async () => saved,
+        save: async record => {
+            saved = structuredClone(record);
+            if (loseReply) {loseReply = false; throw new Error('Lost storage acknowledgement');}
+        }});
+    await view.read();
+    await expect(view.enqueue('Accepted once', [], undefined, 'stored-once')).rejects.toThrow('Lost storage acknowledgement');
+    const recovered = await view.reconcile('stored-once');
+    expect(recovered.instructionQueue?.acceptedIds).toContain('stored-once');
+    expect(client.operation).not.toHaveBeenCalled(); expect(client.turn).not.toHaveBeenCalled();
+    await view.refresh(); await view.refresh();
+    expect(client.turn).toHaveBeenCalledOnce(); await view.close();
+});
+
+it('queues native commands through the command protocol and retries only a definitely rejected attempt', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    client.commands = vi.fn(async () => [{name: 'compact', description: 'Compact', kind: 'action'}]);
+    client.command = vi.fn().mockRejectedValueOnce(Object.assign(new Error('Busy'), {code: 'EBUSY', outcome: 'not-committed'}))
+        .mockResolvedValue({commandId: 'done', output: 'Done'});
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, slashCommands: true}}, 'p', 's', true,
+        {epoch: 'e', load: async () => saved, save: async record => {saved = structuredClone(record);}});
+    await view.read(); await view.enqueue('/compact', [], undefined, 'native-command'); await view.refresh();
+    expect(view.snapshot().instructionQueue).toMatchObject({paused: true, items: [{state: 'failed'}]});
+    await view.editInstructionQueue({action: 'retry', id: 'native-command', expectedRevision: view.snapshot().instructionQueue!.revision});
+    await view.refresh(); await view.refresh();
+    expect(client.turn).not.toHaveBeenCalled(); expect(client.command).toHaveBeenCalledTimes(2);
+    const attempts = vi.mocked(client.command).mock.calls.map(args => args[4]?.requestId);
+    expect(attempts[0]).toBe('native-command'); expect(attempts[1]).not.toBe(attempts[0]);
+    expect(view.snapshot().instructionQueue?.items).toEqual([]); await view.close();
+});
+
+it('restores a preparation-rejected EIO queue entry and waits for an explicit new attempt', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined; const attempts: string[] = [];
+    const capable = {...profile, capabilities: {...profile.capabilities, slashCommands: true}};
+    const native = new MCPHarnessClient({close: vi.fn(), call: async (name, args) => {
+        if (name === 'harness_profiles') return {epoch: 'e', profiles: [capable]};
+        const id = (args as {requestId: string}).requestId; attempts.push(id);
+        return attempts.length === 1 ? {requestId: id, outcome: 'not-committed', code: 'EIO', stage: 'prepare', executionStarted: false}
+            : {requestId: id, outcome: 'committed', result: {commandId: 'native-completed', status: 'completed', output: 'Done'}};
+    }});
+    client.commands = vi.fn(async () => [{name: 'compact', description: 'Compact', kind: 'action'}]);
+    client.command = native.command.bind(native);
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    const first = new HarnessConversation(client, capable, 'p', 's', true, journal);
+    await first.read(); await first.enqueue('/compact', [], undefined, 'preparation-failed'); await first.refresh();
+    expect(first.snapshot()).toMatchObject({pending: false, instructionQueue: {paused: true, items: [{state: 'failed', error: 'EIO'}]}});
+    await first.close();
+    const restored = new HarnessConversation(client, capable, 'p', 's', true, journal); await restored.read(); await restored.refresh();
+    expect(attempts).toEqual(['preparation-failed']); expect(client.operation).not.toHaveBeenCalled();
+    await restored.editInstructionQueue({action: 'retry', id: 'preparation-failed', expectedRevision: restored.snapshot().instructionQueue!.revision});
+    await restored.refresh(); await restored.refresh();
+    expect(attempts).toHaveLength(2); expect(attempts[1]).not.toBe(attempts[0]);
+    expect(restored.snapshot().instructionQueue?.items).toEqual([]);
+    expect(restored.snapshot().instructionQueue?.acceptedIds).toContain('preparation-failed');
+    expect(client.turn).not.toHaveBeenCalled(); await restored.close(); await native.close();
+});
+it('runs declared queries during an active turn without resuming it or queuing the query', async () => {
+    const client = peer();
+    client.commands = vi.fn(async () => [{name: 'session:status', description: 'State', kind: 'action', execution: 'query', id: 'status', revision: 'one'}]);
+    client.command = vi.fn(async () => ({commandId: 'status-op', output: 'running', status: 'completed'}));
+    vi.mocked(client.read).mockResolvedValue({session: {...session, status: 'active', activeTurnId: 'existing'}, turns: []});
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, slashCommands: true}}, 'p', 's');
+    await view.read(); expect(view.snapshot()).toMatchObject({canSend: false, canCommand: true});
+    const result = await view.command('session:status', '', undefined, '/session:status', 'query-id');
+    expect(client.resume).not.toHaveBeenCalled(); expect(client.turn).not.toHaveBeenCalled();
+    expect(result).toMatchObject({active: true, pending: false, submission: {id: 'query-id', status: 'accepted'}});
+    expect(client.command).toHaveBeenCalledWith('codex','s','session:status','', expect.objectContaining({expectedCommand: {id: 'status',revision: 'one'}}));
+    await view.close();
+});
+
+it('pins an asynchronous command receipt while queries run and advances only after its exact completion', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    client.commands = vi.fn(async () => [{name: 'compact',description: 'Compact',kind: 'action',execution: 'serial',revision: 'one'},
+        {name: 'session:status',description: 'State',kind: 'action',execution: 'query'}]);
+    client.command = vi.fn(async (_profile,_session,name) => name === 'compact'
+        ? {commandId: 'compaction',status: 'running'} : {commandId: 'query',status: 'completed',output: 'Running'});
+    const view = new HarnessConversation(client, {...profile,capabilities: {...profile.capabilities,slashCommands: true}}, 'p','s',true,
+        {epoch: 'e',load: async () => saved,save: async value => {saved = structuredClone(value);}});
+    await view.read(); await view.enqueue('/compact',[],undefined,'compact-id'); await view.enqueue('After compact',[],undefined,'next');
+    await view.refresh(); expect(view.snapshot().canSend).toBe(false);
+    await view.command('session:status','',undefined,'/session:status','query-id');
+    await view.refresh(); expect(client.turn).not.toHaveBeenCalled();
+    expect(saved?.instructionQueue?.items[0]).toMatchObject({receipt: {commandId: 'compaction',commandStatus: 'running'}});
+    vi.mocked(client.eventSnapshot).mockResolvedValueOnce({epoch: 'events',cursor: 3,gap: false,requests: [],events: [
+        {seq: 2,message: {method: 'turn/completed',params: {threadId: 's',turn: {id: 'compact-turn',status: 'completed'}}}},
+        {seq: 3,message: {method: 'harness/command/updated',params: {threadId: 's',commandId: 'compaction',turnId: 'compact-turn',status: 'completed',failed: false}}},
+    ]});
+    await view.refresh(); expect(client.turn).toHaveBeenCalledOnce(); expect(vi.mocked(client.turn).mock.calls[0][2]).toBe('After compact');
+    await view.close();
+});
+
+it('rejects a changed native command binding before dispatching a queued instruction', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined, revision = 'original';
+    client.commands = vi.fn(async () => [{name: 'verify',description: 'Verify',kind: 'prompt',id: 'plugin',revision}]);
+    client.command = vi.fn(async () => ({turnId: 't'}));
+    const view = new HarnessConversation(client,{...profile,capabilities: {...profile.capabilities,slashCommands: true}},'p','s',true,
+        {epoch:'e',load:async () => saved,save:async value => {saved = structuredClone(value);}});
+    await view.read(); await view.enqueue('/verify',[],undefined,'bound'); revision = 'changed'; await view.refresh();
+    expect(client.command).not.toHaveBeenCalled(); expect(view.snapshot().instructionQueue).toMatchObject({paused: true,items: [{state: 'failed'}]});
+    await view.close();
+});
+it('recovers a command completion from the exact native turn after losing its final event', async () => {
+    const client = peer();
+    let saved: HarnessRecovery = {sessionId: 's', commandResults: [{commandId: 'compaction', turnId: 'compact-turn', status: 'running', output: '/compact'}]};
+    vi.mocked(client.read).mockResolvedValue({session: {...session, lastTurnId: 'compact-turn', lastTurnResult: 'completed'}, turns: []});
+    const view = new HarnessConversation(client, profile, 'p', 's', true,
+        {epoch: 'e', load: async () => saved, save: async value => {saved = structuredClone(value);}});
+    await view.read();
+    expect(view.snapshot()).toMatchObject({canSend: true, observation: {execution: 'idle'}});
+    await view.refresh();
+    expect(saved.commandResults).toContainEqual(expect.objectContaining({commandId: 'compaction', status: 'completed', failed: false}));
+    await view.close();
+});
 it('creates the first prompt command lazily and keeps session actions unavailable in a draft', async () => {
     const client = peer();
     client.commands = vi.fn(async () => [{name: 'verify', description: 'Verify', kind: 'prompt'}, {name: 'compact', description: 'Compact', kind: 'action'}]);
@@ -260,6 +610,46 @@ it('creates a native branch and recovers an unknown fork without replaying it',a
     expect(await reopened.reconcile()).toMatchObject({sessionId:'branch',pending:false,canSend:false});
     expect(client.fork).toHaveBeenCalledOnce();expect(record?.pending).toBeUndefined();
     await view.close();await reopened.close();
+});
+
+it.each([true, false])('freezes a historical fork point and reconciles only its exact receipt (verified: %s)', async verified => {
+    const client = peer(); client.fork = vi.fn(async () => {throw {outcome: 'unknown'};});
+    vi.mocked(client.read).mockResolvedValue({session, turns: [{id: 'old-turn', status: 'completed', items: [{id: 'u-old', type: 'userMessage', content: [{type: 'text', text: 'Old request'}]}]},
+        {id: 'new-turn', status: 'completed', items: [{id: 'u-new', type: 'userMessage', content: [{type: 'text', text: 'New request'}]}]}]});
+    let record: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {record = structuredClone(value);}};
+    const capable = {...profile, capabilities: {...profile.capabilities, fork: true, checkpointFork: true}};
+    const view = new HarnessConversation(client, capable, 'p', 's', true, journal); await view.read(); await view.saveDraft('Keep my draft');
+    expect(view.snapshot().forkSupport).toBe('turn');
+    await expect(view.forkAt({messageId: 'u-old', turnId: 'old-turn'})).rejects.toMatchObject({outcome: 'unknown'});
+    expect(view.snapshot().canQueue).toBe(false);
+    await expect(view.enqueue('Ambiguous next target')).rejects.toMatchObject({code: 'EBUSY'});
+    expect(record?.pending?.forkCheckpoint).toEqual({sourceSessionId: 's', turnId: 'old-turn'});
+    expect(client.fork).toHaveBeenCalledWith('codex', 's', undefined, expect.objectContaining({lastTurnId: 'old-turn'}));
+    const reopened = new HarnessConversation(client, capable, 'p', 's', true, journal); await reopened.read();
+    vi.mocked(client.operation).mockResolvedValue({requestId: record!.pending!.requestId, outcome: 'committed', result: {
+        session: {...session, id: 'created'}, checkpoint: {sourceSessionId: 's', turnId: verified ? 'old-turn' : 'new-turn', verified: true}}});
+    if (verified) expect(await reopened.reconcile()).toMatchObject({sessionId: 'created', pending: false});
+    else {
+        await expect(reopened.reconcile()).rejects.toMatchObject({outcome: 'committed', remoteCode: 'HARNESS_CHECKPOINT_BOUNDARY_MISMATCH'});
+        expect(reopened.snapshot()).toMatchObject({sessionId: 's', pending: false, forkFailure: {sessionId: 'created', verified: false}});
+        expect(reopened.snapshot().canQueue).toBe(true);
+    }
+    expect(record?.pending).toBeUndefined(); expect(record?.lastFork?.sessionId).toBe('created'); expect(record?.sessionId).toBe('s');
+    expect(reopened.snapshot().draft).toBe('Keep my draft'); expect(client.fork).toHaveBeenCalledOnce(); expect(client.turn).not.toHaveBeenCalled();
+    await view.close(); await reopened.close();
+});
+
+it('does not switch native history before the fork receipt is durable', async () => {
+    const client = peer(); client.fork = vi.fn(async () => ({session: {...session, id: 'created'}}));
+    let record: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => record, save: async (value: HarnessRecovery) => {
+        if (value.lastFork && !value.pending) throw new Error('Receipt storage unavailable'); record = structuredClone(value);
+    }};
+    const view = new HarnessConversation(client, {...profile, capabilities: {...profile.capabilities, fork: true}}, 'p', 's', true, journal); await view.read();
+    await expect(view.fork()).rejects.toMatchObject({outcome: 'unknown'});
+    expect(view.snapshot()).toMatchObject({sessionId: 's', pending: true}); expect(record?.pending?.operation).toBe('fork');
+    await view.close();
 });
 it('groups native siblings and nested branches, excluding independent sessions across list pages',async () => {
     const client=peer(),view=new HarnessConversation(client,profile,'p','s');await view.read();
@@ -642,4 +1032,103 @@ it('keeps unknown frozen submissions unresolved and refuses unrelated receipt id
     vi.mocked(client.operation).mockResolvedValue({requestId: 'unrelated', outcome: 'committed', result: {turnId: 'other'}});
     await expect(view.reconcile('frozen')).rejects.toMatchObject({code: 'EIO'});
     expect(view.snapshot().submission).toBeUndefined(); expect(client.turn).not.toHaveBeenCalled(); await view.close();
+});
+
+
+it('reacquires a reclaimed observation on the same native session before dispatching queued input', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal);
+    await view.read();
+    client.inspect = vi.fn(async () => ({session: {...session, owned: false}}));
+    await view.enqueue('Continue the existing work', [], undefined, 'after-reclaim');
+    await view.refresh();
+    expect(client.resume).toHaveBeenCalledWith('codex', 's', expect.objectContaining({requestId: expect.any(String)}));
+    expect(client.create).not.toHaveBeenCalled();
+    expect(client.turn).toHaveBeenCalledWith('codex', 's', 'Continue the existing work', expect.any(Object));
+    expect(vi.mocked(client.resume).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(client.turn).mock.invocationCallOrder[0]);
+    expect(saved?.instructionQueue?.items[0]?.id).toBe('after-reclaim');
+    await view.close();
+});
+
+it('interrupts a confirmed turn while the original send reply hangs without replacing input recovery', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined, finish!: (value: {turnId: string}) => void;
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    client.turn = vi.fn(() => new Promise(resolve => {finish = resolve;}));
+    let events: Array<{seq: number; message: {method: string; params: Record<string, unknown>}}> = [];
+    client.eventSnapshot = vi.fn(async () => ({epoch: 'events', cursor: events.at(-1)?.seq ?? 0, gap: false, requests: [], events}));
+    vi.mocked(client.read).mockResolvedValue({session: {...session, interruptible: false}, turns: []});
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal); await view.read();
+    const sending = view.send('Original', [], undefined, 'original-send');
+    await vi.waitFor(() => expect(client.turn).toHaveBeenCalledOnce());
+    await view.saveDraft('Keep newer input'); await view.enqueue('Queued next', [], undefined, 'next');
+    events = [{seq: 1, message: {method: 'turn/started', params: {threadId: 's', turn: {id: 'owned'}}}}];
+    await view.refresh(); expect(view.snapshot().canInterrupt).toBe(true);
+    await view.interrupt({sessionId: 's', turnId: 'owned', operationId: 'stop-original'});
+    expect(client.interrupt).toHaveBeenCalledWith('codex', 's', 'owned', expect.objectContaining({requestId: 'stop-original', epoch: 'e'}));
+    expect(saved).toMatchObject({pending: {requestId: 'original-send', operation: 'turn'}, draft: 'Keep newer input', instructionQueue: {paused: false}, controls: [{requestId: 'stop-original', receipt: 'accepted'}]});
+    expect(view.snapshot().canSend).toBe(false);
+    events = [{seq: 2, message: {method: 'turn/completed', params: {threadId: 's', turn: {id: 'owned', status: 'completed'}}}}];
+    vi.mocked(client.read).mockResolvedValue({session: {...session, lastTurnId: 'owned', lastTurnResult: 'completed'}, turns: [{id: 'owned', status: 'completed', items: []}]});
+    await view.refresh();
+    finish({turnId: 'owned'}); await sending;
+    expect(saved?.controls?.[0]).toMatchObject({receipt: 'accepted', terminal: 'completed'});
+    expect(view.snapshot()).toMatchObject({draft: 'Keep newer input', canInterrupt: false});
+    await view.interrupt({sessionId: 's', turnId: 'owned', operationId: 'stop-original'});
+    await expect(view.interrupt({sessionId: 's', turnId: 'other', operationId: 'stop-original'})).rejects.toMatchObject({code: 'ECONFLICT'});
+    expect(client.interrupt).toHaveBeenCalledOnce();
+    expect(client.turn).toHaveBeenCalledOnce(); await view.close();
+});
+
+it('restores an unknown control independently and never resends it after reopen', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined;
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    vi.mocked(client.read).mockResolvedValue({session: {...session, activeTurnId: 't', status: 'active'}, turns: []});
+    client.interrupt = vi.fn(async () => {throw Object.assign(new Error('lost acknowledgement'), {outcome: 'unknown'});});
+    client.operation = vi.fn(async (_profile, id) => ({requestId: id, outcome: 'unknown'}));
+    const first = new HarnessConversation(client, profile, 'p', 's', true, journal); await first.read();
+    await expect(first.interrupt({sessionId: 's', turnId: 't', operationId: 'persisted-stop'})).rejects.toThrow();
+    await first.saveDraft('Retain draft'); expect(saved?.pending).toBeUndefined(); await first.close();
+    vi.mocked(client.read).mockResolvedValue({session: {...session, lastTurnId: 't', lastTurnResult: 'completed'}, turns: []});
+    const next = new HarnessConversation(client, profile, 'p', 's', true, {...journal, epoch: 'different-current-epoch'});
+    expect(await next.read()).toMatchObject({pending: true, canSend: false, controls: [{receipt: 'unknown', effect: 'completed'}]});
+    client.operation = vi.fn(async (_profile, id) => ({requestId: id, outcome: 'committed', result: {}}));
+    expect(await next.reconcileControl('persisted-stop')).toMatchObject({pending: false, canSend: true, draft: 'Retain draft', controls: [{receipt: 'accepted', effect: 'completed'}]});
+    expect(client.operation).toHaveBeenCalledWith('codex', 'persisted-stop', expect.objectContaining({epoch: 'e'}));
+    expect(client.interrupt).toHaveBeenCalledOnce(); await next.close();
+});
+
+it('retains uncertain control settlement after storage failure and refuses mismatched receipts', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined, writes = 0;
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {if (++writes === 2) throw new Error('receipt write failed'); saved = structuredClone(record);}};
+    vi.mocked(client.read).mockResolvedValue({session: {...session, activeTurnId: 't', status: 'active'}, turns: []});
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal); await view.read();
+    await expect(view.interrupt({sessionId: 's', turnId: 't', operationId: 'storage-stop'})).rejects.toThrow('receipt write failed');
+    expect(saved?.controls?.[0].receipt).toBe('pending'); expect(view.snapshot().controls?.[0].receipt).toBe('unknown');
+    client.operation = vi.fn(async (_profile, id) => ({requestId: id, outcome: 'unknown'}));
+    await view.close();
+    const reopened = new HarnessConversation(client, profile, 'p', 's', true, journal); await reopened.read();
+    client.operation = vi.fn(async () => ({requestId: 'wrong', outcome: 'committed', result: {}}));
+    await expect(reopened.reconcileControl('storage-stop')).rejects.toMatchObject({code: 'EIO'});
+    client.operation = vi.fn(async (_profile, id) => ({requestId: id, outcome: 'committed', result: {}}));
+    expect(await reopened.reconcileControl('storage-stop')).toMatchObject({controls: [{receipt: 'accepted', effect: 'unconfirmed'}], canSend: false});
+    expect(client.interrupt).toHaveBeenCalledOnce(); await reopened.close();
+});
+
+it('allows enqueue and queue pause while its claimed native submission reply hangs', async () => {
+    const client = peer(); let saved: HarnessRecovery | undefined, finish!: (value: {turnId: string}) => void;
+    const journal = {epoch: 'e', load: async () => saved, save: async (record: HarnessRecovery) => {saved = structuredClone(record);}};
+    client.turn = vi.fn(() => new Promise(resolve => {finish = resolve;}));
+    const view = new HarnessConversation(client, profile, 'p', 's', true, journal); await view.read();
+    await view.enqueue('First', [], undefined, 'first-unlocked');
+    const pumping = view.refresh(); await vi.waitFor(() => expect(client.turn).toHaveBeenCalledOnce());
+    await view.enqueue('Second', [], undefined, 'second-unlocked');
+    let queue = view.snapshot().instructionQueue!;
+    await view.editInstructionQueue({action: 'update', id: 'second-unlocked', text: 'Revised second', expectedRevision: queue.revision});
+    queue = view.snapshot().instructionQueue!;
+    await view.editInstructionQueue({action: 'pause', expectedRevision: queue.revision});
+    expect(saved?.instructionQueue).toMatchObject({paused: true, items: [{id: 'first-unlocked', state: 'dispatching'}, {id: 'second-unlocked', text: 'Revised second'}]});
+    finish({turnId: 'original'}); await pumping;
+    expect(saved?.instructionQueue).toMatchObject({paused: true, items: [{id: 'first-unlocked', receipt: {turnId: 'original'}}, {id: 'second-unlocked', text: 'Revised second'}]});
+    expect(client.turn).toHaveBeenCalledOnce(); await view.close();
 });

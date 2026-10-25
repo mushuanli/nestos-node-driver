@@ -8,6 +8,7 @@ export interface HarnessMessage {
     contentPartKinds?: string[];
     turnId?: string; name?: string; input?: string; inputLanguage?: 'bash' | 'json' | 'text';
     timestamp?: number; paths?: string[]; operation?: ToolOperation; commandPreview?: string;
+    commandOutput?: import('./contracts').HarnessCommandOutput;
 }
 export {nativeRequest} from './interactions';
 export type {HarnessRequest} from './interactions';

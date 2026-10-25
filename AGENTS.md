@@ -4,6 +4,7 @@
 不得依赖 app-core、UI 或宿主 API。连接配置与目录授权策略归 app-core；凭据解析与 fetch 由宿主注入。
 文件、同步与 harness 各自拥有生命周期。关闭控制面板只关闭客户端等待，不把连接断开当作 turn 已停止。
 修改操作携带 epoch 与 requestId；结果未知时查询 receipt，不自动重放。
+可信节点回执明确 not-committed 时，即使 code=EIO 也不能重新分类为 unknown。队列保留原接纳身份、失败状态及暂停；重开不自动派发，显式 retry 才创建新的原生 attempt，原 requestId 的拒绝事实保持不变。
 原生命令由 profile.capabilities.slashCommands 协商，commands 查询会话目录、command 执行并沿用 receipt；不在客户端按 harness 名猜测命令或 RPC。命令与普通 turn 分开，命令可无 turnId；未知操作保存 inputText，核对接纳时只清理匹配草稿，保留后续输入。旧节点不宣称能力时不发新协议请求。
 验证：pnpm --filter @itookit/mindos-node-driver test / typecheck。
 
@@ -19,10 +20,28 @@ FileStorageBackend 是文件契约；共享文件来源与独立执行会话分�
 
 HarnessRecovery 持久化最近已接纳的 submittedTurnId，重开后与 pending / draftRevision 一起核对输入；模型执行是否完成与提交接纳分开，不因 UI 关闭丢失接纳事实。
 
-快照 forkSupport 区分持久能力与 canFork 的暂时可用性；当前原生 fork 协议只支持 latest，明确拒绝的节点声明 none，不按 harness 名推断历史位置支持。
+快照 forkSupport 区分持久能力与 canFork 的暂时可用性；仅在 checkpointFork 正向协商后声明 turn，否则沿用 fork 对应的 latest/none，不按 harness 名推断能力。forkAt 冻结 sourceSessionId/turnId 到原 pending journal，未知结果只查询原 requestId。已返回原生身份但边界未确认时保存 lastFork/forkFailure，不导航、不清草稿、不伪造未创建；原会话切换必须等回执持久保存。旧节点不发送 lastTurnId，发现失败标未发送。
 
 可选 submissionId 将宿主冻结提交关联到 turn/command 的稳定 requestId；HarnessRecovery 保存独立 submission 的 pending/accepted/rejected 回执，准备子操作仍使用独立请求。核对 create/resume 只确认准备，不接纳未发出的 turn；接纳后存储失败保持 unknown，不能把存储冲突当作原生未执行。
 
 0.4 使用按节点/凭据/授权版本共享的 fetch SSE；Harness、项目目录和进程订阅复用连接。eventSnapshot/directorySnapshot 是本地回放，refresh 是显式投影或权威核对；禁止恢复旧轮询 RPC 或按 active 状态增加定时请求。新增/关闭主题重连时带游标，断线不重放修改；单主题授权错误不能使其他主题离线。
 
 SSE 的连接、主题与观察者故障分别处理；单个 next/error 回调抛错不能使其他订阅失效或阻断重连。HarnessEventFeed 与目录通知逐个隔离观察者，诊断只输出安全类别，不记录异常正文。
+
+HarnessInstructionRuntime 将指令队列持久化到 HarnessRecovery，enqueue 接纳与原生 turn/command 回执分开。队列编辑带 revision，派发先保存领取，未知结果只核对原 requestId；明确拒绝后显式重试才分配新的原生 attemptId。宿主共享控制面并保留后台观察，UI 关闭不拥有队列；snapshot 只投影排队附件名称。
+
+命令 execution=query 可在 active 时直接查询，跳过 resume/adopt；旧目录缺失 execution 时保守串行。队列冻结定义 id/revision，发出 expectedCommand 后由原生节点复验；查询不能覆盖队列项自己的持久回执。异步命令需确切 turn 或 command 终态才续发，恢复时同样适用；scope/loaded 明确区分受控进程与外部历史。
+
+HarnessControlLedger 在既有 HarnessRecovery.controls 保存精确 sessionId/turnId、独立 requestId/epoch 和接纳回执，原生 terminal 单独观察并持久保存。取消不占输入提交槽、不消费草稿、不隐式暂停队列；unknown 或 accepted 未确认终态时阻止冲突派发。reconcileControl 只查询原操作，不能重发。canInterrupt 不依赖发送 Promise，仍验证授权、可信观察及原生 interruptible；不据此声明 pause 支持。队列锁只覆盖领取、编辑与结算，远程等待在锁外，迟到响应按队首及 attempt 身份合并，不覆盖后续编辑。
+
+capabilities.commandQueries 正向协商 harness_query；queryCommand/reconcileQuery 独立于输入 pending、busy、草稿及原生修改 receipt。查询报告保存到既有 commandResults，并带原生 sessionId 和定义身份；持久确认后才投影 queryReceipts。未知报告只重试保存，不重发修改、不以查询 ID 调用 harness_operation。旧节点不发新请求。
+
+原生输入由公开 validateHarnessTurnInput / validateHarnessAttachments 在修改前严格校验；prompt 限制按 UTF-8 字节计算，图片同时核对 MIME、规范 base64 和文件签名。旧 HarnessRecovery 草稿及队列读取使用 readStoredAttachments，保持既有形状和容量限制，不以新发送规则阻断查询、取消或修复。真正派发再严格校验，失败显示具体原因且不创建/恢复/发送；未知旧操作仅核对原 requestId，不重新校验后重放。队列新增、文本更新、合并及显式重试均校验实际新输入；失败不改变原修订。严格校验器不是资产授权或远端文件准备凭据。
+
+纯附件提交在队列与草稿中保留原始空正文，prepareTurnInput 只为实际原生 turn 生成确定性的文件名称提示；pending.inputText 和 draftRevision 仍核对原输入。纯输入校验错误带 not-committed 与具体 remoteCode，以便 RPC 和 UI 确认为拒绝；结果未知的旧操作仍仅核对。
+
+capabilities.commandOutputs 正向协商 command/operation 的 outputMode=reference，旧节点不带新字段。HarnessCommandOutputRef 固定 version/epoch/requestId/bytes/sha256/text/plain；readCommandOutput 使用相同项目授权和固定引用，严格校验范围、规范base64、进度与EOF；loadCommandOutput 默认8MiB、上限32MiB，完整读取校验字节数和SHA-256，取消及读取错误局部化，不改 refreshError 或发送资格。普通输出按UTF-8保留最多64KiB预览；旧节点超限正文保留真实接纳/终态并明确 outputError，不能声称完整产物可读。
+
+MCP 已确认 committed 后的解码错误保留 committed，原始回执只在模块私有 WeakMap 暂存，不进入异常属性、恢复记录、日志或广播。command ID/终态封套无效时，在原 commandResults 保存固定 operationId/epoch/resultError，submission 仍为 accepted；清理传输 pending 但保留派发屏障，允许查询和继续入队，禁止 retry 生成新 attempt 重放。原ID/epoch只读核对可修复，不消费后来草稿。最近64项窗口仅淘汰已收尾的展示项，不淘汰 resultError 或 running；查询压力和重开不能解除屏障。
+
+native command 历史及事件以同 commandId 的稳定锚点合并；原生正文回显不能覆盖已固定预览/输出引用，迟到无ref或不同ref的更新不能替换原不可变产物。真实同ID终态可结束 running，但不能用其他命令或文字相同推断完成。command/turn结果ID在解码和队列恢复统一为最多1024字符。

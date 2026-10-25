@@ -1,6 +1,6 @@
 import { FSError } from '@itookit/vfs-core';
 import { validateUsage } from './usage';
-import type { HarnessAttachment, HarnessEvents, HarnessHistory, HarnessPage, HarnessProfile, HarnessReceipt, HarnessSession } from './contracts';
+import type { HarnessEvents, HarnessHistory, HarnessPage, HarnessProfile, HarnessReceipt, HarnessSession } from './contracts';
 
 function record(value: unknown): Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalid();
@@ -21,6 +21,8 @@ export function validateSession(value: unknown): HarnessSession {
         || !(v.parentSessionId === undefined || v.parentSessionId === null || typeof v.parentSessionId === 'string')
         || !(v.branchName === undefined || v.branchName === null || typeof v.branchName === 'string')
         || (v.forkable !== undefined && typeof v.forkable !== 'boolean')
+        || (v.interruptible !== undefined && typeof v.interruptible !== 'boolean')
+        || (v.loaded !== undefined && typeof v.loaded !== 'boolean')
         || (v.owned !== undefined && typeof v.owned !== 'boolean')
         || (v.archived !== undefined && typeof v.archived !== 'boolean')
         || (v.archiveAllowed !== undefined && typeof v.archiveAllowed !== 'boolean')
@@ -48,7 +50,10 @@ export function validateProfiles(value: unknown): { epoch: string; profiles: Har
             || p.workspaces.some(w => typeof record(w).id !== 'string')
             || (caps.fork !== undefined && typeof caps.fork !== 'boolean')
             || (caps.search !== undefined && typeof caps.search !== 'boolean')
-            || ['models', 'slashCommands', 'usage', 'searchPrompts', 'searchKeywords', 'rename', 'archive', 'unarchive', 'delete'].some(key => caps[key] !== undefined && typeof caps[key] !== 'boolean')
+            || ['models', 'slashCommands', 'commandQueries', 'commandOutputs', 'usage', 'checkpointFork', 'searchPrompts', 'searchKeywords', 'rename', 'archive', 'unarchive', 'delete'].some(key => caps[key] !== undefined && typeof caps[key] !== 'boolean')
+            || caps.checkpointFork === true && caps.fork !== true
+            || caps.commandQueries === true && caps.slashCommands !== true
+            || caps.commandOutputs === true && caps.slashCommands !== true
             || caps.attachments !== undefined && (!Array.isArray(caps.attachments) || caps.attachments.length > 2 || caps.attachments.some(kind => !['text', 'image'].includes(String(kind))))
             || ['history','create','resume','interrupt','interactions'].some(key => typeof caps[key] !== 'boolean')) throw invalid();
     }
@@ -90,26 +95,7 @@ export function validateReceipt(value: unknown): HarnessReceipt {
     return v as unknown as HarnessReceipt;
 }
 
-/** Validate locally owned drafts before writing or starting a native operation. */
-export function validateAttachments(value: unknown): HarnessAttachment[] {
-    if (value === undefined) return [];
-    const fail = () => new FSError('EINVAL', 'Invalid native attachment draft');
-    if (!Array.isArray(value) || value.length > 5) throw fail();
-    let total = 0;
-    for (const file of value) {
-        if (!file || !['text', 'image'].includes(file.kind) || typeof file.content !== 'string' || typeof file.name !== 'string'
-            || !file.name || /[\x00-\x1f\x7f/\\]/.test(file.name) || new TextEncoder().encode(file.name).byteLength > 256) throw fail();
-        const size = new TextEncoder().encode(file.content).byteLength; total += size;
-        if (file.kind === 'text' && (size > 64 * 1024 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(file.content))) throw fail();
-        if (file.kind === 'image') {
-            if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.mimeType) || !file.content.startsWith(`data:${file.mimeType};base64,`)) throw fail();
-            const encoded = file.content.split(',')[1] ?? '';
-            if (!encoded || encoded.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length / 4 * 3 - (encoded.endsWith('==') ? 2 : encoded.endsWith('=') ? 1 : 0) > 256 * 1024) throw fail();
-        }
-    }
-    if (total > 512 * 1024) throw fail();
-    return structuredClone(value as HarnessAttachment[]);
-}
+export {validateAttachments} from './attachments';
 
 export function validateDeletedSessionIds(value: unknown, sessionId: string): string[] {
     if (!Array.isArray(value) || !value.includes(sessionId) || value.length > 16401

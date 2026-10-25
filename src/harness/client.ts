@@ -5,19 +5,46 @@ import { HarnessRpc } from './rpc';
 import { HarnessEventFeed } from './event-feed';
 import { validateUsage } from './usage';
 import {validateModels, validateModelSelection} from './models';
-import {validateCommands, validateCommandResult} from './commands';
+import {validateCommandCatalog, validateCommandResult} from './commands';
 import { validateDeletedSessionIds, validateHistory, validatePage, validateProfiles, validateReceipt, validateSession } from './validation';
+import {validateForkResult} from './forks';
+import {validateTurnInput} from './attachments';
+import {decodeCommittedResult} from './committed-result';
+import {outputRange, validateCommandOutputRef, validateCommandOutputPage} from './command-output';
 
 /** Native task ownership lives on the gateway; this client never replays a mutation. */
 export class MCPHarnessClient implements HarnessClient {
+    private checkpointProfiles: import('./contracts').HarnessProfile[] = [];
     async models(profileId: string, sessionId?: string, options?: OperationOptions) {
         return validateModels(await this.rpc.call('harness_models', {...this.scope, profileId, ...(sessionId ? {sessionId} : {})}, options));
     }
     async commands(profileId: string, sessionId?: string, options?: OperationOptions) {
-        return validateCommands(await this.rpc.call('harness_commands', {...this.scope, profileId, ...(sessionId ? {sessionId} : {})}, options));
+        return (await this.commandCatalog(profileId, sessionId, options)).commands;
+    }
+    async commandCatalog(profileId: string, sessionId?: string, options?: OperationOptions) {
+        return validateCommandCatalog(await this.rpc.call('harness_commands', {...this.scope, profileId, ...(sessionId ? {sessionId} : {})}, options));
+    }
+    async readCommandOutput(profileId: string, value: import('./contracts').HarnessCommandOutputRef, options?: import('./contracts').HarnessCommandOutputOptions) {
+        const ref = validateCommandOutputRef(value), range = outputRange(ref, options);
+        options?.signal?.throwIfAborted();
+        if (!this.checkpointProfiles.length) await this.profiles(options);
+        const profile = this.checkpointProfiles.find(row => row.id === profileId || row.aliases?.includes(profileId));
+        if (!profile?.capabilities.commandOutputs) throw new FSError('ECAPABILITY', 'Native command output reads require a newer server');
+        const page = await this.rpc.call('harness_command_output', {...this.scope, profileId, requestId: ref.requestId,
+            epoch: ref.epoch, sha256: ref.sha256, bytes: ref.bytes, ...range}, options);
+        options?.signal?.throwIfAborted(); return validateCommandOutputPage(page, ref, options);
     }
     async command(profileId: string, sessionId: string, command: string, args: string, options?: import('./contracts').HarnessCommandOptions) {
-        return await this.mutate('harness_command', {profileId, sessionId, command, arguments: args, ...(options?.selection ? {selection: validateModelSelection(options.selection)} : {})}, options, validateCommandResult) as import('./contracts').HarnessCommandResult;
+        return await this.mutate('harness_command', {profileId, sessionId, command, arguments: args, ...(options?.expectedCommand ? {expectedCommand: options.expectedCommand} : {}), ...(options?.selection ? {selection: validateModelSelection(options.selection)} : {})}, options, validateCommandResult) as import('./contracts').HarnessCommandResult;
+    }
+    async queryCommand(profileId: string, sessionId: string, command: string, args: string, options?: import('./contracts').HarnessQueryOptions) {
+        const profile = this.checkpointProfiles.find(row => row.id === profileId || row.aliases?.includes(profileId));
+        if (!profile?.capabilities.commandQueries) throw new FSError('ECAPABILITY', 'Independent command queries require a newer server');
+        const requestId = options?.requestId ?? createRequestId();
+        const result = validateCommandResult(await this.rpc.call('harness_query', {...this.scope, profileId, sessionId, command,
+            arguments: args, requestId, ...(options?.expectedCommand ? {expectedCommand: options.expectedCommand} : {})}, options));
+        if (result.commandId !== requestId || result.turnId || result.status !== 'completed') throw new FSError('EIO', 'Invalid read-only command result');
+        return result;
     }
     private epoch?: string;
     private readonly feeds = new Map<string, HarnessEventFeed>();
@@ -77,7 +104,8 @@ export class MCPHarnessClient implements HarnessClient {
         const value = validateProfiles(await this.rpc.call('harness_profiles', {}, options));
         this.epoch = value.epoch;
         if (this.scope) value.profiles=value.profiles.filter(profile => profile.projectRuntime).map(profile => ({...profile,projectCapabilities:this.scope!.capabilities,workspaces:[{id:this.scope!.projectId}]}));
-        if (this.scope?.capabilities?.sessionControl === false) value.profiles=value.profiles.map(profile => ({...profile, capabilities:{...profile.capabilities,create:false,resume:false,interrupt:false,interactions:false,fork:false,rename:false,archive:false,unarchive:false,delete:false}}));
+        if (this.scope?.capabilities?.sessionControl === false) value.profiles=value.profiles.map(profile => ({...profile, capabilities:{...profile.capabilities,create:false,resume:false,interrupt:false,interactions:false,fork:false,checkpointFork:false,rename:false,archive:false,unarchive:false,delete:false}}));
+        this.checkpointProfiles = structuredClone(value.profiles);
         return value;
     }
     async list(profileId: string, query = {}, options?: OperationOptions): Promise<HarnessPage> {
@@ -98,8 +126,23 @@ export class MCPHarnessClient implements HarnessClient {
             return {session:(await this.read(profileId,sessionId,options)).session};
         }
     }
-    fork(profileId: string, sessionId: string, name?: string, options?: HarnessMutationOptions) {
-        return this.session('harness_fork', {profileId, sessionId, ...(name ? {name} : {})}, options);
+    async fork(profileId: string, sessionId: string, name?: string, options?: import('./contracts').HarnessForkOptions): Promise<import('./contracts').HarnessForkResult> {
+        const checkpoint = options?.lastTurnId;
+        const mutationOptions = {...options, requestId: options?.requestId ?? createRequestId()};
+        if (checkpoint !== undefined) await this.assertCheckpointFork(profileId, checkpoint, mutationOptions);
+        return await this.mutate('harness_fork', {profileId, sessionId, ...(name ? {name} : {}),
+            ...(checkpoint !== undefined ? {lastTurnId: checkpoint} : {})}, mutationOptions, value => {
+            return validateForkResult(value, sessionId, checkpoint);
+        }) as import('./contracts').HarnessForkResult;
+    }
+    private async assertCheckpointFork(profileId: string, checkpoint: string, options: HarnessMutationOptions): Promise<void> {
+        try {
+            if (typeof checkpoint !== 'string' || !checkpoint || checkpoint.length > 256) throw new FSError('EINVAL', 'Invalid native checkpoint');
+            if (!this.checkpointProfiles.length) await this.profiles(options);
+            const profile = this.checkpointProfiles.find(row => row.id === profileId || row.aliases?.includes(profileId));
+            if (!profile?.capabilities.checkpointFork) throw new FSError('ECAPABILITY', 'Native checkpoint fork is unavailable');
+        } catch (error) {throw Object.assign(error instanceof FSError ? error : new FSError('EIO', 'Native checkpoint capability discovery failed'),
+            {outcome: 'not-committed', requestId: options.requestId});}
     }
     async delete(profileId: string, sessionId: string, options?: HarnessMutationOptions): Promise<{deletedSessionIds: string[]}> {
         return await this.mutate('harness_delete', {profileId, sessionId}, options, value => {
@@ -121,7 +164,10 @@ export class MCPHarnessClient implements HarnessClient {
         }) as { session: HarnessSession };
     }
     async turn(profileId: string, sessionId: string, prompt: string, options?: import('./contracts').HarnessTurnOptions) {
-        return await this.mutate('harness_turn', { profileId, sessionId, prompt, ...(options?.selection ? {selection: validateModelSelection(options.selection)} : {}), ...(options?.attachments?.length ? {attachments: options.attachments} : {}) }, options, value => {
+        let attachments: ReturnType<typeof validateTurnInput>;
+        try {attachments = validateTurnInput(prompt, options?.attachments);}
+        catch (error) {throw Object.assign(error as Error, {outcome: 'not-committed', requestId: options?.requestId ?? createRequestId()});}
+        return await this.mutate('harness_turn', { profileId, sessionId, prompt, ...(options?.selection ? {selection: validateModelSelection(options.selection)} : {}), ...(attachments.length ? {attachments} : {}) }, options, value => {
             const result = value as { turnId?: unknown };
             if (typeof result?.turnId !== 'string' || !result.turnId) throw new FSError('EIO', 'Invalid harness turn');
             return { turnId: result.turnId };
@@ -135,9 +181,14 @@ export class MCPHarnessClient implements HarnessClient {
     }
     async operation(profileId: string, requestId: string, options?: OperationOptions): Promise<HarnessReceipt> {
         if (!this.epoch) await this.profiles(options);
-        const receipt = validateReceipt(await this.rpc.call('harness_operation', { ...this.scope, profileId, requestId, epoch: (options as HarnessMutationOptions)?.epoch ?? this.epoch }, options));
+        const receipt = validateReceipt(await this.rpc.call('harness_operation', { ...this.scope, profileId, requestId,
+            epoch: (options as HarnessMutationOptions)?.epoch ?? this.epoch, ...this.outputMode(profileId) }, options));
         if (receipt.requestId !== requestId) throw new FSError('EIO', 'Mismatched harness receipt');
         return receipt;
+    }
+    private outputMode(profileId: unknown): {outputMode?: 'reference'} {
+        const profile = this.checkpointProfiles.find(row => row.id === profileId || row.aliases?.includes(String(profileId)));
+        return profile?.capabilities.commandOutputs ? {outputMode: 'reference'} : {};
     }
     private async mutate(name: string, args: object, options?: HarnessMutationOptions, decode = (value: unknown): unknown => value): Promise<unknown> {
         const requestId = options?.requestId ?? createRequestId();
@@ -145,10 +196,11 @@ export class MCPHarnessClient implements HarnessClient {
         try {
             if (!this.epoch) await this.profiles(options);
             sent = true;
-            const receipt = validateReceipt(await this.rpc.call(name, { ...args, ...this.scope, epoch: options?.epoch ?? this.epoch, requestId }, options));
+            const mode = name === 'harness_command' ? this.outputMode((args as {profileId?: string}).profileId) : {};
+            const receipt = validateReceipt(await this.rpc.call(name, { ...args, ...this.scope, epoch: options?.epoch ?? this.epoch, requestId, ...mode }, options));
             if (receipt.requestId !== requestId) throw new FSError('EIO', 'Mismatched harness receipt');
             if (receipt.outcome !== 'committed') throw Object.assign(new FSError('EIO', receipt.code ?? 'Harness operation incomplete'), receipt);
-            return decode(receipt.result);
+            return decodeCommittedResult(receipt, decode);
         } catch (error) {
             if (sent && error && typeof error === 'object' && 'outcome' in error) throw error;
             throw Object.assign(new FSError('EIO', sent ? 'Harness operation outcome unknown' : 'Harness operation was not sent'),

@@ -1,10 +1,63 @@
 import { expect, it, vi } from 'vitest';
-import {validateCommands} from '../src/harness/commands';
+import {validateCommands, validateCommandCatalog} from '../src/harness/commands';
 import { MCPHarnessClient } from '../src/harness/client';
 import { createMindOSNodeDriver } from '../src/provider';
 import { validateEvents, validateHistory, validatePage, validateProfiles, validateSession } from '../src/harness/validation';
 
 const session = { id: 's',title:'<script>x</script>',cwd:'/workspace',status:'idle',updatedAt:1,resumable:true };
+it('rejects invalid turn input as not committed without discovering or mutating a remote session', async () => {
+    const call = vi.fn(), client = new MCPHarnessClient({call, close: vi.fn()});
+    await expect(client.turn('native', 's', '中'.repeat(50000), {requestId: 'too-large'})).rejects.toMatchObject({
+        outcome: 'not-committed', requestId: 'too-large', attachmentCode: 'HARNESS_PROMPT_LIMIT'});
+    await expect(client.turn('native', 's', 'Review', {requestId: 'bad-file', attachments: [
+        {kind: 'image', name: 'a.png', mimeType: 'image/png', content: 'data:image/png;base64,AQID'},
+    ]})).rejects.toMatchObject({outcome: 'not-committed', requestId: 'bad-file', attachmentCode: 'HARNESS_ATTACHMENT_MIME_MISMATCH'});
+    expect(call).not.toHaveBeenCalled(); await client.close();
+});
+it('negotiates a receipt-free command query and rejects malformed results or legacy capabilities', async () => {
+    const capabilities = {history: true, create: true, resume: true, interrupt: true, interactions: true, slashCommands: true, commandQueries: true};
+    let result: unknown = {commandId: 'query', output: 'State', status: 'completed'};
+    const call = vi.fn(async (name: string) => name === 'harness_profiles' ? {epoch: 'e', profiles: [{id: 'native', kind: 'native', workspaces: [], capabilities}]} : result);
+    const client = new MCPHarnessClient({call, close: vi.fn()}); await client.profiles();
+    expect(await client.queryCommand('native', 's', 'session:status', '', {requestId: 'query'})).toEqual(result);
+    expect(call).toHaveBeenLastCalledWith('harness_query', {profileId: 'native', sessionId: 's', command: 'session:status', arguments: '', requestId: 'query'}, {requestId: 'query'});
+    for (const invalid of [{commandId: 'wrong', status: 'completed'}, {commandId: 'query', status: 'running'}, {commandId: 'query', status: 'completed', turnId: 't'}]) {
+        result = invalid; await expect(client.queryCommand('native', 's', 'session:status', '', {requestId: 'query'})).rejects.toThrow('Invalid read-only command result');
+    }
+    capabilities.commandQueries = false; await client.profiles(); const before = call.mock.calls.length;
+    await expect(client.queryCommand('native', 's', 'session:status', '')).rejects.toMatchObject({code: 'ECAPABILITY'});
+    expect(call).toHaveBeenCalledTimes(before); await client.close();
+});
+it('preserves incomplete native command observations without turning them into an empty complete catalog', async () => {
+    const value = {commands: [{name: 'session:status', description: 'State', kind: 'action', execution: 'query'}],
+        observation: {complete: false, code: 'DSH_SESSION_NOT_ATTACHED'}};
+    const client = new MCPHarnessClient({call: vi.fn(async () => value), close: vi.fn()});
+    expect(await client.commandCatalog('dsh', 's')).toEqual(value);
+    expect(await client.commands('dsh', 's')).toEqual(value.commands);
+    expect(validateCommandCatalog({commands: []})).toEqual({commands: []});
+    for (const observation of [{complete: false}, {complete: 'false'}, {complete: false, code: 'private failure text'}, []])
+        expect(() => validateCommandCatalog({...value, observation})).toThrow('Invalid command catalog observation');
+    await client.close();
+});
+it('negotiates exact checkpoint fork and preserves created identity when proof is absent', async () => {
+    const profile = {id: 'codex', kind: 'codex', workspaces: [], capabilities: {history: true, create: true, resume: true, interrupt: true,
+        interactions: true, fork: true, checkpointFork: true}};
+    const call = vi.fn(async (name, args) => name === 'harness_profiles' ? {epoch: 'e', profiles: [profile]}
+        : {outcome: 'committed', requestId: args.requestId, result: {session: {...session, id: 'created'}}});
+    const client = new MCPHarnessClient({call, close: vi.fn()});
+    expect(await client.fork('codex', 's', undefined, {requestId: 'fork', lastTurnId: 'old-turn'})).toMatchObject({
+        session: {id: 'created'}, checkpoint: {sourceSessionId: 's', turnId: 'old-turn', verified: false, code: 'HARNESS_CHECKPOINT_BOUNDARY_UNKNOWN'}});
+    expect(call).toHaveBeenLastCalledWith('harness_fork', expect.objectContaining({sessionId: 's', lastTurnId: 'old-turn', requestId: 'fork'}), expect.anything());
+});
+it('does not send checkpoint requests to legacy nodes or turn discovery failure into an unknown mutation', async () => {
+    const call = vi.fn(async () => ({epoch: 'e', profiles: []})), client = new MCPHarnessClient({call, close: vi.fn()});
+    await expect(client.fork('codex', 's', undefined, {requestId: 'fork', lastTurnId: 'old-turn'}))
+        .rejects.toMatchObject({code: 'ECAPABILITY', outcome: 'not-committed', requestId: 'fork'});
+    expect(call).toHaveBeenCalledOnce();
+    const failed = new MCPHarnessClient({call: vi.fn(async () => {throw new Error('Discovery unavailable');}), close: vi.fn()});
+    await expect(failed.fork('codex', 's', undefined, {requestId: 'fork', lastTurnId: 'old-turn'}))
+        .rejects.toMatchObject({outcome: 'not-committed', requestId: 'fork'});
+});
 it('validates optional native archive eligibility without accepting truthy values', () => {
     for (const archiveAllowed of [true, false]) expect(validateSession({...session, archiveAllowed}).archiveAllowed).toBe(archiveAllowed);
     for (const archiveAllowed of ['true', 1, null, {}]) expect(() => validateSession({...session, archiveAllowed})).toThrow();
@@ -100,7 +153,9 @@ it('retains receipt identity when a committed payload cannot be decoded',async (
         ? {epoch:'e',profiles:[]} : {outcome:'committed',requestId:(args as {requestId:string}).requestId,result:{session:{id:'broken'}}});
     const client = new MCPHarnessClient({call,close:vi.fn()});
     const error = await client.create('codex','project').catch(e => e);
-    expect(error.outcome).toBe('unknown'); expect(typeof error.requestId).toBe('string');
+    expect(error.outcome).toBe('committed'); expect(typeof error.requestId).toBe('string');
+    expect(error.remoteCode).toBe('HARNESS_COMMITTED_RESULT_INVALID');
+    expect(JSON.stringify(error)).not.toContain('broken');
     expect(call.mock.calls.filter(([name]) => name === 'harness_create')).toHaveLength(1);
 });
 

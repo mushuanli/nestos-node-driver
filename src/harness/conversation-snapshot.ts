@@ -6,6 +6,8 @@ import type {HarnessObservation} from './state';
 import type {HarnessUsage} from './usage';
 
 export interface HarnessConversationActions {
+    canQueryCommand?: boolean;
+    canCommand?: boolean;
     canSend: boolean;
     canInterrupt: boolean;
     canRespond: boolean;
@@ -17,12 +19,20 @@ export interface HarnessConversationActions {
 }
 /** Public read model; runtime fields and private implementation never define this contract. */
 export interface HarnessConversationSnapshot extends HarnessConversationActions {
+    resultError?: {operationId: string; code: string};
+    queryReceipts?: Array<{id: string; status: 'accepted'}>;
+    pendingQueryReports?: string[];
+    controls?: import('./control-ledger').HarnessControlProjection[];
+    canCommand?: boolean;
+    canQueue?: boolean;
+    instructionQueue?: import('./instruction-queue').HarnessQueueProjection;
     sessionId?: string;
     title: string;
     createdAt?: number | null;
     updatedAt?: number | null;
     branchName?: string;
     forkSupport?: 'none' | 'latest' | 'turn';
+    forkFailure?: import('./forks').HarnessForkReceipt;
     archived: boolean;
     deletedSessionIds: string[];
     messages: HarnessMessage[];
@@ -37,6 +47,7 @@ export interface HarnessConversationSnapshot extends HarnessConversationActions 
     supportsModels?: boolean;
     supportsSlashCommands?: boolean;
     slashCommands?: HarnessSlashCommand[];
+    commandCatalogObservation?: import('./contracts').HarnessCommandObservation;
     usage?: HarnessUsage;
     usageUnavailable?: boolean;
     /** Compatibility projections of observation, never independent state. */
