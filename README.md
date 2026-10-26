@@ -179,3 +179,25 @@ A matching `committed` receipt remains committed even when its result cannot be 
 `HarnessConversation.interrupt({sessionId, turnId, operationId})` freezes an exact native target and writes an independent control receipt before dispatch. `reconcileControl(operationId)` queries that original operation and epoch without replaying cancellation. `snapshot().controls` separates `receipt` (`unknown`, `accepted`, `rejected`) from the observed `effect` (`unconfirmed`, `completed`, `failed`, `cancelled`). Acknowledgement does not prove termination. Recovery uses the existing journal, preserves input drafts and pending sends, and retains exact terminal observations across reopening.
 
 A suspended send reply does not block queue edits or native cancellation. Cancellation itself does not pause the queue; hosts can persist an explicit queue pause before requesting cancellation. Unknown controls and acknowledged controls without terminal evidence prevent conflicting dispatch. Hosts must pass the explicit operation identity when reconciling UI operations and must keep native capability and ownership checks. Pause and steering are separate capabilities.
+
+### Recovering completion from native history
+
+Terminal history turns may carry `submissionEvidence` version 1 with `requestId`,
+`promptSha256`, `startSequence`, and `endSequence`. The server derives this evidence
+from a complete ordered native turn in the returned page; the client never infers
+completion from assistant message text or native idle alone. Older nodes can omit it.
+
+For an already admitted, attachment-free prompt whose original turn identity equals
+its request ID, `HarnessConversation` matches the retained instruction against this
+provenance before recording its terminal result. Mismatched Session, input digest,
+duplicate request evidence, malformed boundaries, or attachment-bearing inputs cannot
+release the old claim. Normal turn IDs and native completion events keep their existing
+meaning. Evidence does not create another execution, mutate native history or consume
+the next draft.
+
+`reconcile(originalId)` can persist settlement of the admitted head. It does not dispatch
+an instruction that was only queued, replay an unknown operation, or start later queued
+work. Queue pause is preserved. Missing old history requires explicit `loadEarlier` and
+another reconciliation; no unbounded automatic scan is introduced. A failed settlement
+write keeps the original claim recoverable. Merely completed assistant items no longer
+substitute for terminal turn facts.

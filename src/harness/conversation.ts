@@ -1,3 +1,4 @@
+import {recoverHistoryCompletions} from './history-completion';
 import {validateModels, validateModelSelection, validateAvailableSelection} from './models';
 import {HarnessControlLedger, type HarnessInterruptRequest} from './control-ledger';
 import {HarnessCommandQueries} from './conversation-queries';
@@ -194,7 +195,7 @@ export class HarnessConversation implements HarnessConversationPort {
             load: async () => (await this.journal?.load())?.instructionQueue,
             reconcile: id => this.reconcileInstruction(id),
             command: id => this.commandResults.find(row => row.commandId === id),
-            completion: id => this.turnResults.get(id) ?? (this.messages.some(message => message.turnId === id && message.role === 'assistant' && message.status === 'completed') ? this.session?.lastTurnResult ?? 'completed' : undefined),
+            completion: id => this.turnResults.get(id),
             send: item => this.sendInstruction(item)});
         this.controls = new HarnessControlLedger({
             before: async () => {
@@ -463,6 +464,7 @@ export class HarnessConversation implements HarnessConversationPort {
         if (this.deletedSessionIds.length) return this.snapshot();
         if (this.session) {
             const history = await this.client.read(this.profile.id, this.session.id, {...this.options(), toolDetail: 'summary'});
+            await this.observeHistoryCompletion(history);
             const nativeMessages = historyMessages(history); this.observeCommandHistory(nativeMessages);
             const messages = nativeMessages.map(message => projectCommandMessage(message, this.commandResults));
             for (const value of history.turns ?? []) {
@@ -494,6 +496,7 @@ export class HarnessConversation implements HarnessConversationPort {
         if (!this.session || !this.earlier || this.busy) throw new FSError('EBUSY','No earlier history available');
         const history = await this.client.read(this.profile.id, this.session.id, {...this.options(), cursor:this.earlier, toolDetail: 'summary'});
         if (history.nextCursor === this.earlier || history.nextCursor && this.historyCursors.has(history.nextCursor)) throw new FSError('EIO','History cursor did not advance');
+        await this.observeHistoryCompletion(history);
         this.messages = mergeMessages(historyMessages(history), this.messages); this.expandedHistory = true;
         this.historyCursors.add(this.earlier);
         this.earlier = history.nextCursor ?? undefined;
@@ -624,6 +627,19 @@ export class HarnessConversation implements HarnessConversationPort {
             if (terminal) this.commandUpdated({commandId: row.commandId, status: 'completed', failed: terminal.status === 'failed'});
         }
     }
+    private async observeHistoryCompletion(history: import('./contracts').HarnessHistory): Promise<void> {
+        const started = Date.now(), sessionId = this.session!.id;
+        const proofs = await recoverHistoryCompletions(history, sessionId, this.instructions.record.items);
+        if (this.lifetime.signal.aborted || this.session?.id !== sessionId) return;
+        for (const proof of proofs) {
+            const status = proof.status === 'interrupted' ? 'cancelled' : proof.status;
+            if (this.turnResults.get(proof.turnId) === status) continue;
+            this.recordTurnResult(proof.turnId, proof.status);
+            console.info('[Harness] Turn history evidence', {operation: 'turn.history.reconcile', operationId: proof.turnId,
+                sessionId: this.session!.id, stage: 'native_history', result: 'confirmed', code: 'HARNESS_TURN_HISTORY_CONFIRMED',
+                durationMs: Date.now() - started});
+        }
+    }
     private recordTurnResult(id: string, status?: string): void {
         const result = status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'interrupted' || status === 'cancelled' ? 'cancelled' : undefined;
         if (!result) return;
@@ -746,7 +762,11 @@ export class HarnessConversation implements HarnessConversationPort {
             await this.reconcileSubmission(issue.operationId); return this.readReconciled();
         }
         if (submissionId && !this.instructions.hasReceipt(submissionId)) await this.instructions.reload();
-        if (submissionId && this.instructions.hasReceipt(submissionId)) return {...await this.read(), submission: {id: submissionId, status: 'accepted'}};
+        if (submissionId && this.instructions.hasReceipt(submissionId)) {
+            const snapshot = await this.read();
+            if (await this.instructions.settleAccepted(submissionId, snapshot)) this.notify();
+            return {...this.snapshot(), submission: {id: submissionId, status: 'accepted'}};
+        }
         if (!this.pending) {
             if (submissionId && (this.submission?.id !== submissionId || this.submission.status === 'pending')) await this.reconcileSubmission(submissionId);
             return this.readReconciled();

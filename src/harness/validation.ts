@@ -1,3 +1,4 @@
+import {terminalTurn} from './history-completion';
 import { FSError } from '@itookit/vfs-core';
 import { validateUsage } from './usage';
 import type { HarnessEvents, HarnessHistory, HarnessPage, HarnessProfile, HarnessReceipt, HarnessSession } from './contracts';
@@ -71,6 +72,7 @@ export function validateHistory(value: unknown): HarnessHistory {
         const cursor = record(v.eventCursor);
         if (!Number.isSafeInteger(cursor.after) || (cursor.after as number) < 0 || typeof cursor.eventEpoch !== 'string' || !cursor.eventEpoch) throw invalid();
     }
+    for (const turn of v.turns ?? []) terminalTurn(turn);
     return {...v, session} as unknown as HarnessHistory;
 }
 export function validateEvents(value: unknown): HarnessEvents {

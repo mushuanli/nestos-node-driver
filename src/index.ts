@@ -1,3 +1,4 @@
+export type {HarnessTurnSubmissionEvidence} from './harness/contracts';
 export { createMindOSNodeDriver } from './provider';
 /** @deprecated Use createMindOSNodeDriver. */
 export { createMindOSNodeDriver as createMindOSNodeClient } from './provider';

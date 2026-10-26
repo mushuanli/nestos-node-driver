@@ -32,6 +32,10 @@ export interface HarnessEvents {
     epoch: string; cursor: number; gap: boolean; events: HarnessEvent[]; requests: Array<HarnessEvent['message']>;
 }
 export interface HarnessPage { sessions: HarnessSession[]; nextCursor: string | null }
+/** Native provenance within a complete ordered turn; attached to a terminal history turn. */
+export interface HarnessTurnSubmissionEvidence {
+    version: 1; requestId: string; promptSha256: string; startSequence: number; endSequence: number;
+}
 export interface HarnessHistory {
     session: HarnessSession; turns: unknown[] | null; nextCursor?: string | null;
     /** Native snapshot boundary; resume events after the items already included in history. */

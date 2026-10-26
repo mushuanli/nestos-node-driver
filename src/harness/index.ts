@@ -1,3 +1,4 @@
+export type {HarnessTurnSubmissionEvidence} from './contracts';
 export type { HarnessClient, HarnessMutationOptions, HarnessProfile, HarnessSession, HarnessPage, HarnessHistory, HarnessHistoryOptions, HarnessEventsOptions, HarnessEvent, HarnessEvents, HarnessReceipt } from './contracts';
 export type {HarnessInterruptRequest, HarnessControlRecord, HarnessControlProjection} from './control-ledger';
 export {validateControls} from './control-ledger';

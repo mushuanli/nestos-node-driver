@@ -160,6 +160,17 @@ export class HarnessInstructionRuntime {
             code: error ? (error as {attachmentCode?: string}).attachmentCode ?? (error as {remoteCode?: string}).remoteCode ?? (error as {code?: string}).code ?? 'EIO' : undefined};
         if (error) console.warn('[Harness] Instruction queue', metadata); else console.info('[Harness] Instruction queue', metadata);
     }
+    /** Settle an admitted head only; receipt inspection never dispatches queued work. */
+    async settleAccepted(id: string, snapshot: HarnessConversationSnapshot): Promise<boolean> {
+        return this.serialize(async () => {
+            await this.sync();
+            const item = this.record.items[0], revision = this.record.revision;
+            if (!item || (item.attemptId ?? item.id) !== id || !item.receipt
+                || !['dispatching', 'uncertain'].includes(item.state)) return false;
+            await this.settle(item, snapshot);
+            return this.record.revision !== revision;
+        });
+    }
     async pump(): Promise<void> {
         if (this.pumping) return;
         this.pumping = true;
