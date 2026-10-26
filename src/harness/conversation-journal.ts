@@ -14,6 +14,8 @@ export interface HarnessRecovery {
     commandResults?: HarnessCommandRecord[];
     sessionId?: string;
     pending?: {requestId: string; epoch: string; operation: string; inputText?: string; draftRevision?: number;
+        /** Queued execution has no ownership of the current composer draft. */
+        consumeDraft?: false;
         forkCheckpoint?: import('./forks').ForkCheckpoint};
 }
 export interface HarnessConversationJournal {

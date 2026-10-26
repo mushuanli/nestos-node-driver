@@ -62,11 +62,11 @@ export class HarnessConversation implements HarnessConversationPort {
         return {...command, arguments: parsed[2] ?? ''};
     }
     private async sendInstruction(item: HarnessInstruction): Promise<HarnessConversationSnapshot> {
-        if (!item.commandKind) return this.send(item.text, item.attachments, item.selection, item.attemptId ?? item.id);
+        if (!item.commandKind) return this.sendTurn(item.text, item.attachments, item.selection, item.attemptId ?? item.id, true);
         const command = await this.queuedCommand(item.text);
         if (!command || command.kind !== item.commandKind || command.execution === 'query'
             || item.commandId !== undefined && command.id !== item.commandId || item.commandRevision !== undefined && command.revision !== item.commandRevision) throw new FSError('ECAPABILITY', 'Queued native command changed or is unavailable');
-        return this.command(command.name, command.arguments, item.selection, item.text, item.attemptId ?? item.id, command);
+        return this.sendCommand(command.name, command.arguments, item.selection, item.text, item.attemptId ?? item.id, command, true);
     }
     async models(): Promise<HarnessModelCatalog> {
         if (!this.profile.capabilities.models || !this.client.models) return {models: []};
@@ -107,6 +107,9 @@ export class HarnessConversation implements HarnessConversationPort {
         this.notify(); return this.snapshot();
     }
     async command(name: string, args = '', selection?: HarnessModelSelection, inputText?: string, submissionId?: string, expected?: Pick<HarnessSlashCommand, 'id' | 'revision' | 'kind' | 'execution'>) {
+        return this.sendCommand(name, args, selection, inputText, submissionId, expected);
+    }
+    private async sendCommand(name: string, args = '', selection?: HarnessModelSelection, inputText?: string, submissionId?: string, expected?: Pick<HarnessSlashCommand, 'id' | 'revision' | 'kind' | 'execution'>, queued = false) {
         const requested = selection ? validateModelSelection(selection) : undefined;
         if (!this.loaded || Date.now() - this.observedAt > 30_000) await this.beforeSubmission(() => this.read());
         if (!this.client.command) throw new FSError('ECAPABILITY', 'Native command unavailable');
@@ -125,9 +128,9 @@ export class HarnessConversation implements HarnessConversationPort {
         if (!this.session && command.kind !== 'prompt') throw new FSError('ECAPABILITY', 'Native command requires a session');
         const selected = requested && command.kind === 'prompt' ? validateAvailableSelection(requested, await this.beforeSubmission(() => this.models())) : undefined;
         if (!available()) throw new FSError('EBUSY', 'Native command unavailable');
-        if (!this.draft) this.setDraft(text, []);
+        if (!queued && !this.draft) this.setDraft(text, []);
         this.startSubmission(submissionId);
-        const submission = {inputText: text, draftRevision: this.draftRevision};
+        const submission = {inputText: text, draftRevision: this.draftRevision, ...(queued ? {consumeDraft: false as const} : {})};
         this.submittedTurnId = undefined;
         return this.mutate(async () => {
             if (command.execution !== 'query') await this.prepareSession();
@@ -274,6 +277,7 @@ export class HarnessConversation implements HarnessConversationPort {
     private async restore() {
         if (this.loaded) return;
         const record = await this.journal?.load();
+        if (record?.pending?.consumeDraft !== undefined && record.pending.consumeDraft !== false) throw new FSError('EINVAL', 'Invalid native draft consumption');
         if (record?.sessionId && !this.session) this.session = {id: record.sessionId, title: record.sessionId, cwd: null, status: null, updatedAt: null, resumable: false};
         this.deletedSessionIds = record?.deletedSessionIds ?? [];
         this.instructions.restore(record?.instructionQueue);
@@ -304,7 +308,12 @@ export class HarnessConversation implements HarnessConversationPort {
         if (text !== this.draft || JSON.stringify(attachments) !== JSON.stringify(this.draftAttachments)) ++this.draftRevision;
         this.draft = text; this.draftAttachments = attachments;
     }
-    private acceptDraft(submission: {inputText?: string; draftRevision?: number}): void {
+    private acceptDraft(submission: {inputText?: string; draftRevision?: number; consumeDraft?: false}): void {
+        if (submission.consumeDraft === false) {
+            try {console.debug('[Harness] Composer draft preserved', {operation: 'harness.draft.admission', operationId: this.pending?.requestId,
+                stage: 'queued_admission', result: 'preserved', code: 'HARNESS_QUEUE_DRAFT_PRESERVED', durationMs: 0});} catch { /* Diagnostics do not own draft consumption. */ }
+            return;
+        }
         if (submission.draftRevision !== undefined && submission.draftRevision !== this.draftRevision) return;
         if (submission.inputText !== undefined && submission.inputText !== this.draft) return;
         this.setDraft('', []);
@@ -436,7 +445,7 @@ export class HarnessConversation implements HarnessConversationPort {
         }
     }
     private async native<T>(operation: string, call: (options: import('./contracts').HarnessMutationOptions) => Promise<T>,
-        submission?: {inputText: string; draftRevision: number}, committed?: (result: T) => void, forkCheckpoint?: ForkCheckpoint): Promise<T> {
+        submission?: {inputText: string; draftRevision: number; consumeDraft?: false}, committed?: (result: T) => void, forkCheckpoint?: ForkCheckpoint): Promise<T> {
         const epoch = this.journal?.epoch ?? (await this.client.profiles(this.options())).epoch;
         const requestId = ['turn', 'command'].includes(operation) && this.submission?.status === 'pending' ? this.submission.id : createRequestId();
         this.pending = {requestId, epoch, operation, ...submission, ...(forkCheckpoint ? {forkCheckpoint} : {})};
@@ -653,6 +662,9 @@ export class HarnessConversation implements HarnessConversationPort {
         if (this.turnResults.size > 1024) this.turnResults.delete(this.turnResults.keys().next().value!);
     }
     async send(text: string, attachments?: HarnessAttachment[], selection?: HarnessModelSelection, submissionId?: string) {
+        return this.sendTurn(text, attachments, selection, submissionId);
+    }
+    private async sendTurn(text: string, attachments?: HarnessAttachment[], selection?: HarnessModelSelection, submissionId?: string, queued = false) {
         const {prompt, attachments: prepared} = prepareTurnInput(text, attachments);
         const requested = selection ? validateModelSelection(selection) : undefined;
         if (!this.loaded || Date.now() - this.observedAt > 30_000) await this.beforeSubmission(() => this.read());
@@ -661,9 +673,9 @@ export class HarnessConversation implements HarnessConversationPort {
         const selected = requested ? validateAvailableSelection(requested, await this.beforeSubmission(() => this.models())) : undefined;
         if (!this.snapshot().canSend) throw new FSError('EBUSY', 'Conversation cannot send');
         this.submittedTurnId = undefined;
-        this.setDraft(text, prepared);
+        if (!queued) this.setDraft(text, prepared);
         this.startSubmission(submissionId);
-        const submission = {inputText: text, draftRevision: this.draftRevision};
+        const submission = {inputText: text, draftRevision: this.draftRevision, ...(queued ? {consumeDraft: false as const} : {})};
         return this.mutate(async () => {
             await this.prepareSession();
             await this.native('turn', options => this.client.turn(this.profile.id, this.session!.id, prompt,

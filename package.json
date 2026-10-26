@@ -1,6 +1,6 @@
 {
   "name": "@itookit/mindos-node-driver",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Platform-independent client for mindos-node: controlled files, projects, sync, processes and native AI harness sessions.",
   "type": "module",
   "main": "./src/index.ts",

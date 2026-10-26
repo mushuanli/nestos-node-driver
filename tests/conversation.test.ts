@@ -228,6 +228,8 @@ it('queues attachment-only input using its original identity and reconciles a lo
     client.turn = vi.fn(async () => {throw {outcome: 'unknown'};});
     const first = new HarnessConversation(client, capable, 'p', 's', true, journal); await first.read();
     await first.saveDraft('', files); await first.enqueue('', files, undefined, 'file-only');
+    // The host consumes the matching composer after durable queue admission.
+    await first.saveDraft('', []);
     expect(record!.instructionQueue!.items[0]).toMatchObject({id: 'file-only', text: '', attachments: files});
     await first.refresh(); expect(client.turn).toHaveBeenCalledWith('codex', 's', 'Attachments: notes.txt', expect.objectContaining({requestId: 'file-only', attachments: files}));
     expect(record!.pending).toMatchObject({requestId: 'file-only', inputText: '', operation: 'turn'}); await first.close();

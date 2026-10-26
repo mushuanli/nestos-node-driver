@@ -204,3 +204,12 @@ substitute for terminal turn facts.
 
 A history refresh may reuse a recorded terminal result only under the same turn ID.
 A newer lastTurnId without a result cannot inherit a previous turn’s completion.
+
+
+Queued execution never owns the current composer draft. Dispatch uses the same validated
+native input path as a direct send, but neither replaces the draft with the queued input
+nor consumes the draft when native admission arrives. The pending journal stores
+`consumeDraft: false` so reopening and late receipt reconciliation preserve this boundary,
+even when the next draft has identical text. Legacy direct sends keep their existing
+revision and input matching rules. Queue admission and the host OperationLedger remain
+the authority for consuming the submitted editor draft.
