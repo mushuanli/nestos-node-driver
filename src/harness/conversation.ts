@@ -472,7 +472,7 @@ export class HarnessConversation implements HarnessConversationPort {
                 if (turn.id) this.recordTurnResult(turn.id, turn.status);
             }
             this.messages = this.expandedHistory ? mergeMessages(this.messages, messages) : messages;
-            this.session = {...history.session, lastTurnResult: history.session.lastTurnResult ?? this.session.lastTurnResult};
+            this.session = {...history.session, lastTurnResult: history.session.lastTurnResult ?? (history.session.lastTurnId ? this.turnResults.get(history.session.lastTurnId) : undefined)};
             if (this.session.lastTurnId) this.recordTurnResult(this.session.lastTurnId, this.session.lastTurnResult);
             if (history.eventCursor) this.cursor = {...history.eventCursor};
             this.observedAt = Date.now(); this.source = 'history'; this.gap = false;

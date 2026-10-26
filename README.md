@@ -201,3 +201,6 @@ work. Queue pause is preserved. Missing old history requires explicit `loadEarli
 another reconciliation; no unbounded automatic scan is introduced. A failed settlement
 write keeps the original claim recoverable. Merely completed assistant items no longer
 substitute for terminal turn facts.
+
+A history refresh may reuse a recorded terminal result only under the same turn ID.
+A newer lastTurnId without a result cannot inherit a previous turn’s completion.

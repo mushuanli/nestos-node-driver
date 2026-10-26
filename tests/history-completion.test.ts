@@ -109,3 +109,30 @@ it('retains the original claim if persisting history-confirmed settlement fails,
     try {await second.read(); await second.reconcile('original'); expect(second.snapshot().instructionQueue?.items).toEqual([]); expect(f.client.turn).toHaveBeenCalledTimes(1);}
     finally {await second.close();}
 });
+
+
+it('does not carry a previous turn result onto a different history turn identity', async () => {
+    const f = await fixture();
+    vi.mocked(f.client.read).mockResolvedValue({session: {...session, lastTurnId: 'previous', lastTurnResult: 'completed'}, turns: []});
+    const view = f.open();
+    try {
+        await view.read();
+        vi.mocked(f.client.read).mockResolvedValue({session: {...session, lastTurnId: 'original'}, turns: []});
+        await view.reconcile('original');
+        expect(view.snapshot().instructionQueue?.items).toHaveLength(1);
+        expect(f.client.turn).toHaveBeenCalledTimes(1);
+    } finally {await view.close();}
+});
+
+it('retains an observed terminal result only when later history keeps the same turn identity', async () => {
+    const f = await fixture();
+    vi.mocked(f.client.read).mockResolvedValue({session: {...session, lastTurnId: 'original', lastTurnResult: 'completed'}, turns: []});
+    const view = f.open();
+    try {
+        await view.read();
+        vi.mocked(f.client.read).mockResolvedValue({session: {...session, lastTurnId: 'original'}, turns: []});
+        await view.reconcile('original');
+        expect(view.snapshot().instructionQueue?.items).toEqual([]);
+        expect(f.client.turn).toHaveBeenCalledTimes(1);
+    } finally {await view.close();}
+});
