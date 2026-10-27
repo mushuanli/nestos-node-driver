@@ -1,6 +1,6 @@
 {
   "name": "@itookit/mindos-node-driver",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Platform-independent client for mindos-node: controlled files, projects, sync, processes and native AI harness sessions.",
   "type": "module",
   "main": "./src/index.ts",
@@ -18,7 +18,7 @@
     "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@itookit/vfs-core": "5.3.3",
+    "@itookit/vfs-core": "5.3.4",
     "@itookit/vfs-sync": "0.1.1",
     "@modelcontextprotocol/client": "2.0.0"
   },
