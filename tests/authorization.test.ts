@@ -1,7 +1,7 @@
 import {describe,it,expect,vi} from 'vitest';
 import {validateAuthorization,validateProjectCapabilities} from '../src/authorization';
 import {HttpTransport} from '../src/files/transport';
-import {createMindOSNodeDriver} from '../src/provider';
+import {createNestOSNodeDriver} from '../src/provider';
 import {MCPProjectClient} from '../src/projects';
 const authorization={principalId:'alice',anonymous:false,revision:'a'.repeat(64)};
 const capabilities={fileRead:true,fileWrite:false,run:true,sessionRead:true,sessionControl:true};
@@ -38,7 +38,7 @@ describe('directory authorization contracts',()=>{
             const request=JSON.parse(String(init?.body));
             return Response.json({jsonrpc:'2.0',id:request.id,result:{resultType:'complete',ttlMs:0,cacheScope:'private',supportedVersions:['2026-07-28'],capabilities:{tools:{}},_meta:{'itookit/pi-agent':{version:1,httpEndpoint:'./',fileProtocol:'fs-agent-http-v1',harness:false,serverId:'node',authorization:{...authorization,principalId:'anonymous',anonymous:true}}}}});
         });
-        const driver=createMindOSNodeDriver(resolve,fetch as typeof globalThis.fetch);
+        const driver=createNestOSNodeDriver(resolve,fetch as typeof globalThis.fetch);
         expect((await driver.discover({endpoint:'https://files.test/mcp',credentialRef:'public',anonymous:true})).authorization?.anonymous).toBe(true);
         expect(resolve).not.toHaveBeenCalled();await driver.dispose();
     });

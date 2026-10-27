@@ -10,9 +10,9 @@ it('sends structured SQLite SeqFile transactions with explicit revisions', async
     });
     const client = new HttpSeqClient({ endpoint: 'http://localhost/', alias: 'docs', credential: () => 'secret', fetch });
     try {
-        const snapshot = await client.snapshot('/.mindos/info.seq');
+        const snapshot = await client.snapshot('/.nestos/info.seq');
         expect(snapshot.entries[0].value).toEqual({ id: 'project' });
-        expect(await client.transaction('/.mindos/info.seq', snapshot.revision, [{ action: 'set', key: 'title', value: 'Name' }]))
+        expect(await client.transaction('/.nestos/info.seq', snapshot.revision, [{ action: 'set', key: 'title', value: 'Name' }]))
             .toEqual({ revision: 'new' });
         expect(new Headers(fetch.mock.calls[1][1]?.headers).get('x-operation-id')).toBeTruthy();
         await expect(client.snapshot('../escape.seq')).rejects.toMatchObject({ code: 'EINVAL' });

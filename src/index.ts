@@ -1,16 +1,16 @@
 export type {HarnessTurnSubmissionEvidence} from './harness/contracts';
-export { createMindOSNodeDriver } from './provider';
-/** @deprecated Use createMindOSNodeDriver. */
-export { createMindOSNodeDriver as createMindOSNodeClient } from './provider';
-/** @deprecated Use MindOSNodeDriver. */
-export type { MindOSNodeDriver as MindOSNodeClient } from './provider';
-/** @deprecated Use createMindOSNodeDriver. */
-export { createMindOSNodeDriver as createPiAgentDriver } from './provider';
-/** @deprecated Use MindOSNodeDriver and MindOSNodeDescriptor. */
-export type { MindOSNodeDriver as PiAgentDriver, MindOSNodeDescriptor as PiAgentDescriptor } from './provider';
+export { createNestOSNodeDriver } from './provider';
+/** @deprecated Use createNestOSNodeDriver. */
+export { createNestOSNodeDriver as createNestOSNodeClient } from './provider';
+/** @deprecated Use NestOSNodeDriver. */
+export type { NestOSNodeDriver as NestOSNodeClient } from './provider';
+/** @deprecated Use createNestOSNodeDriver. */
+export { createNestOSNodeDriver as createPiAgentDriver } from './provider';
+/** @deprecated Use NestOSNodeDriver and NestOSNodeDescriptor. */
+export type { NestOSNodeDriver as PiAgentDriver, NestOSNodeDescriptor as PiAgentDescriptor } from './provider';
 export type { RemoteAuthorization, RemoteProjectCapabilities } from './authorization';
 export { validateAuthorization } from './authorization';
-export type { MindOSNodeDriver, MindOSNodeDescriptor } from './provider';
+export type { NestOSNodeDriver, NestOSNodeDescriptor } from './provider';
 export * from './files/index';
 export type { HarnessClient, HarnessMutationOptions, HarnessProfile, HarnessSession, HarnessPage, HarnessHistory, HarnessHistoryOptions, HarnessEvent, HarnessEvents, HarnessReceipt } from './harness/contracts';
 
@@ -46,3 +46,7 @@ export type {HarnessInterruptRequest, HarnessControlRecord, HarnessControlProjec
 export type {HarnessCommandCatalog, HarnessCommandObservation} from './harness/contracts';
 export type {HarnessCommandOutputRef, HarnessCommandOutputPage, HarnessCommandOutputOptions, HarnessCommandOutputLoadOptions,
     HarnessCommandOutputIssue, HarnessCommandOutput} from './harness/contracts';
+
+/** @deprecated Use the NestOS names; legacy factories keep working. */
+export {createNestOSNodeDriver as createMindOSNodeDriver, createNestOSNodeDriver as createMindOSNodeClient} from "./provider";
+export type {NestOSNodeDriver as MindOSNodeDriver, NestOSNodeDriver as MindOSNodeClient, NestOSNodeDescriptor as MindOSNodeDescriptor} from "./provider";
