@@ -27,18 +27,23 @@ export class HttpFSBackend implements FileStorageBackend {
         const exports = await readExports(this.http, options);
         const target = exports.find(item => item.alias === this.options.alias);
         if (!target) throw new FSError('EACCES', 'Export unavailable');
-        if (supportsMutations(target)) this.mutations = this.createMutations();
+        if (supportsMutations(target)) this.mutations = this.createMutations(target.metadata === true);
         this.initialized = true;
     }
     async close(): Promise<void> { this.http.close(); }
     operationStatus(id: string, options?: OperationOptions) {
         return this.http.json<{ outcome: string; result?: unknown; code?: string }>(`${this.base}/operations/${encodeURIComponent(id)}`, {}, options);
     }
-    private createMutations(): FileMutations {
+    private createMutations(metadata: boolean): FileMutations {
         const command = (action: string, path: string, extra: object, options?: OperationOptions) =>
             this.http.mutate(`${this.base}/mutate`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ action, path: validPath(path), ...extra }) }, `${this.base}/operations`, options);
         return {
+            ...(metadata ? {updateMetadata: async (path: string, patch: Record<string, unknown>, options?: OperationOptions) => {
+                const values = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined));
+                const removeKeys = Object.keys(patch).filter(key => patch[key] === undefined);
+                await command('metadata', path, {metadata: values, removeKeys}, options);
+            }} : {}),
             replace: async (path, data, condition, options) => {
                 const headers = new Headers({ 'Content-Type': 'application/octet-stream' });
                 headers.set(condition.kind === 'create-only' ? 'If-None-Match' : 'If-Match', condition.kind === 'create-only' ? '*' : condition.revision);

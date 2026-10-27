@@ -192,3 +192,33 @@ it('rejects missing list attributes instead of exposing invalid directory entrie
     await expect(backend.files.list('')).rejects.toMatchObject({ code: 'EIO' });
     await backend.close();
 });
+
+it('keeps metadata on the remote source across different mount depths, with normal readonly guards', async () => {
+    const {createFileSystemView} = await import('@itookit/vfs-core');
+    const stored = new Map<string, Record<string, unknown>>(), mutations: string[] = [];
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith('/exports')) return writableExport({metadata: true});
+        const body = JSON.parse(String(init?.body));
+        if (url.pathname.endsWith('/stat')) return json({results: body.paths.map((path: string) => ({stat: {
+            kind: path.endsWith('.md') ? 'file' : 'directory', metadata: stored.get(path) ?? {}, revision: 'original',
+        }}))});
+        if (url.pathname.endsWith('/mutate')) {
+            expect(body.action).toBe('metadata'); expect(body.path).toBe('nested/note.md'); mutations.push(body.path);
+            const value = {...stored.get(body.path), ...body.metadata}; body.removeKeys.forEach((key: string) => delete value[key]); stored.set(body.path, value);
+            return json({outcome: 'committed', result: {}});
+        }
+        throw new Error('Unexpected transport request');
+    };
+    const first = await openHttpFileSource({...config, fetch}), second = await openHttpFileSource({...config, fetch});
+    const nested = createFileSystemView({viewId: 'nested', mounts: [{mountId: 'remote', at: '/workspace', root: '/nested', fs: second.fs, access: 'rw'}]});
+    const readonly = createFileSystemView({viewId: 'readonly', mounts: [{mountId: 'remote', at: '/', fs: second.fs, access: 'ro'}]});
+    try {
+        await first.fs.driver.updateMetadata('/nested/note.md', {_custom: {anchor: 'a'}, other: 1});
+        expect((await nested.driver.getNode('/workspace/note.md'))?.metadata._custom).toEqual({anchor: 'a'});
+        await nested.driver.updateMetadata('/workspace/note.md', {other: undefined});
+        expect((await first.fs.driver.getNode('/nested/note.md'))?.metadata).toEqual({_custom: {anchor: 'a'}});
+        await expect(readonly.driver.updateMetadata('/nested/note.md', {x: 1})).rejects.toMatchObject({code: 'EROFS'});
+        expect(mutations).toHaveLength(2);
+    } finally {await nested.dispose(); await readonly.dispose(); await first.dispose(); await second.dispose();}
+});
